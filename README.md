@@ -1,0 +1,69 @@
+# MeshOnWiregard
+
+This repo provides a minimal inventory-driven workflow for generating WireGuard mesh configs and a failover helper to swap peer endpoints when the primary host is unreachable.
+
+## Files
+
+- `wgmesh.sh`: Inventory-aware helper script with `validate`, `gen`, `install-failover`, and `apply` subcommands.
+- `mesh.conf`: Example inventory format.
+- `usr/local/bin/wg-failover`: Template failover helper script.
+- `wg-failover.service`: systemd unit for the failover check.
+- `wg-failover.timer`: systemd timer for periodic failover checks.
+
+## Usage steps (exact)
+
+1. **Copy and edit the inventory**
+   ```bash
+   cp mesh.conf mesh.local.conf
+   $EDITOR mesh.local.conf
+   ```
+2. **Validate the inventory**
+   ```bash
+   ./wgmesh.sh validate -c mesh.local.conf
+   ```
+3. **Generate configs**
+   ```bash
+   ./wgmesh.sh gen -c mesh.local.conf -o ./out
+   ```
+4. **Install the config on a node**
+   ```bash
+   sudo ./wgmesh.sh apply -c mesh.local.conf -o ./out --node alpha
+   ```
+5. **Install the failover helper and systemd units**
+   ```bash
+   sudo ./wgmesh.sh install-failover
+   ```
+6. **Enable the timer**
+   ```bash
+   sudo systemctl enable --now wg-failover.timer
+   ```
+7. **Verify status**
+   ```bash
+   sudo systemctl status wg-quick@wg0.service
+   sudo systemctl status wg-failover.timer
+   ```
+
+## Inventory requirements
+
+- `[mesh]` must include `interface` (e.g., `wg0`).
+- Each `[node "name"]` entry must include:
+  - `address` (CIDR), `public_key`, `endpoint`, and `allowed_ips`.
+- `endpoint_alt` is optional but recommended for failover.
+- `allowed_ips` may be a comma-delimited list of CIDRs.
+
+## Validation behavior
+
+`wgmesh.sh validate` will:
+
+- Confirm the mesh interface is set.
+- Confirm each node has the required fields.
+- Ensure addresses and public keys are unique.
+- Validate CIDR formatting and endpoint formats.
+- Print a summary inventory.
+
+## Failover behavior
+
+- `wgmesh.sh gen` writes a `wg-failover.conf` file in the output directory.
+- `wgmesh.sh apply` installs that file to `/etc/wireguard/wg-failover.conf`.
+- The `wg-failover` script checks the primary endpoint hostname reachability using `ping`.
+- If the primary host is unreachable and a secondary is reachable, it updates the peer endpoint via `wg set`.
