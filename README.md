@@ -5,6 +5,7 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 ## Files
 
 - `wgmesh.sh`: Inventory-aware helper script with `validate`, `gen`, `install-failover`, and `apply` subcommands.
+- `wgmesh.sh`: Also includes `apply-remote` to install configs over SSH using your local SSH config.
 - `mesh.conf`: Example inventory format.
 - `usr/local/bin/wg-failover`: Template failover helper script.
 - `wg-failover.service`: systemd unit for the failover check.
@@ -25,19 +26,28 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ```bash
    ./wgmesh.sh gen -c mesh.local.conf -o ./out
    ```
+   If you want the tool to generate missing keypairs locally:
+   ```bash
+   ./wgmesh.sh gen -c mesh.local.conf -o ./out --gen-keys
+   ```
 4. **Install the config on a node**
    ```bash
    sudo ./wgmesh.sh apply -c mesh.local.conf -o ./out --node alpha
    ```
-5. **Install the failover helper and systemd units**
+5. **Install configs remotely over SSH**
+   ```bash
+   ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all
+   ```
+   You can combine with `--gen-keys` to generate missing keypairs locally before pushing.
+6. **Install the failover helper and systemd units**
    ```bash
    sudo ./wgmesh.sh install-failover
    ```
-6. **Enable the timer**
+7. **Enable the timer**
    ```bash
    sudo systemctl enable --now wg-failover.timer
    ```
-7. **Verify status**
+8. **Verify status**
    ```bash
    sudo systemctl status wg-quick@wg0.service
    sudo systemctl status wg-failover.timer
@@ -79,9 +89,15 @@ for macOS.
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
 - Each `[node "name"]` entry must include:
-  - `address` (CIDR), `public_key`, `endpoint`, and `allowed_ips`.
+  - `address` (CIDR), `endpoint`, and `allowed_ips`.
+  - `public_key` is required unless you run with `--gen-keys` and provide a writable `private_key_path` (or allow keys to be generated under `out/keys`).
+- Optional SSH fields (used by `apply-remote`):
+  - `ssh_host` (defaults to the node name, supports SSH config aliases),
+  - `ssh_user` (optional override user),
+  - `ssh_port` (optional port override; otherwise SSH config is used).
 - `endpoint_alt` is optional but recommended for failover.
 - `private_key` or `private_key_path` can be provided to embed the key when generating configs.
+  - With `--gen-keys`, missing keys are generated with `wg genkey` and public keys are derived with `wg pubkey`.
 - `allowed_ips` may be a comma-delimited list of CIDRs.
 
 ## Validation behavior
