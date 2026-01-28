@@ -14,13 +14,21 @@ Commands:
   gen                      Generate WireGuard configs for all nodes.
   install-failover         Install wg-failover script and systemd units.
   apply                    Generate and install config for a single node.
+  apply-remote             Apply config to remote node(s) over SSH.
 
 Options (common):
   -c, --config <path>      Path to mesh.conf (default: ./mesh.conf)
   -o, --out <dir>          Output directory for generated configs (default: ./out)
+  --gen-keys               Generate missing keypairs locally (requires wg).
 
 Options (apply):
   -n, --node <name>        Node name to install on this host (required).
+  --interface <ifname>     Override interface name (default from mesh.conf).
+  --dry-run                Print target paths without writing.
+
+Options (apply-remote):
+  -n, --node <name>        Node name to install on remote host.
+  --all                    Apply to all nodes in inventory.
   --interface <ifname>     Override interface name (default from mesh.conf).
   --dry-run                Print target paths without writing.
 
@@ -29,6 +37,7 @@ Examples:
   ./wgmesh.sh gen -o ./out
   sudo ./wgmesh.sh apply --node alpha
   sudo ./wgmesh.sh install-failover
+  ./wgmesh.sh apply-remote --all
 USAGE
 }
 
@@ -80,6 +89,8 @@ parse_mesh_conf() {
 
 resolve_private_key() {
   local node="$1"
+  local out_dir="$2"
+  local gen_keys="$3"
   local private_key="${NODE_FIELDS[$node.private_key]:-}"
   local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
 
@@ -93,7 +104,73 @@ resolve_private_key() {
     return
   fi
 
+  if [[ "$gen_keys" == "true" ]]; then
+    if ! command -v wg >/dev/null 2>&1; then
+      echo "wg is required to generate keys but was not found in PATH." >&2
+      exit 1
+    fi
+    if [[ -z "$private_key_path" ]]; then
+      private_key_path="$out_dir/keys/${node}.key"
+      NODE_FIELDS["$node.private_key_path"]="$private_key_path"
+    fi
+    mkdir -p "$(dirname "$private_key_path")"
+    umask 077
+    wg genkey > "$private_key_path"
+    umask 022
+    private_key="$(cat "$private_key_path")"
+    NODE_FIELDS["$node.private_key"]="$private_key"
+    echo "$private_key"
+    return
+  fi
+
   echo "<PLACE_PRIVATE_KEY_HERE>"
+}
+
+resolve_ssh_target() {
+  local node="$1"
+  local host="${NODE_FIELDS[$node.ssh_host]:-}"
+  local user="${NODE_FIELDS[$node.ssh_user]:-}"
+
+  if [[ -z "$host" ]]; then
+    host="$node"
+  fi
+
+  if [[ -n "$user" ]]; then
+    echo "${user}@${host}"
+  else
+    echo "$host"
+  fi
+}
+
+resolve_public_key() {
+  local node="$1"
+  local out_dir="$2"
+  local gen_keys="$3"
+  local public_key="${NODE_FIELDS[$node.public_key]:-}"
+
+  if [[ -n "$public_key" ]]; then
+    echo "$public_key"
+    return
+  fi
+
+  if [[ "$gen_keys" == "true" ]]; then
+    if ! command -v wg >/dev/null 2>&1; then
+      echo "wg is required to generate public keys but was not found in PATH." >&2
+      exit 1
+    fi
+    local private_key
+    private_key="$(resolve_private_key "$node" "$out_dir" "$gen_keys")"
+    if [[ "$private_key" == "<PLACE_PRIVATE_KEY_HERE>" ]]; then
+      echo "" >&2
+      return
+    fi
+    public_key="$(printf '%s' "$private_key" | wg pubkey)"
+    NODE_FIELDS["$node.public_key"]="$public_key"
+    echo "$public_key"
+    return
+  fi
+
+  echo ""
 }
 
 validate_endpoint() {
@@ -155,6 +232,7 @@ print_inventory() {
 
 validate_config() {
   local file="$1"
+  local gen_keys="$2"
   load_config "$file"
 
   local errors=0
@@ -179,8 +257,13 @@ validate_config() {
     local endpoint_alt="${NODE_FIELDS[$node.endpoint_alt]:-}"
     local allowed_ips="${NODE_FIELDS[$node.allowed_ips]:-}"
 
-    if [[ -z "$address" || -z "$public_key" || -z "$endpoint" || -z "$allowed_ips" ]]; then
-      echo "Node $node missing required fields (address, public_key, endpoint, allowed_ips)" >&2
+    if [[ -z "$address" || -z "$endpoint" || -z "$allowed_ips" ]]; then
+      echo "Node $node missing required fields (address, endpoint, allowed_ips)" >&2
+      errors=$((errors + 1))
+    fi
+
+    if [[ -z "$public_key" && "$gen_keys" != "true" ]]; then
+      echo "Node $node missing required field: public_key" >&2
       errors=$((errors + 1))
     fi
 
@@ -241,19 +324,22 @@ validate_config() {
 gen_configs() {
   local file="$1"
   local out_dir="$2"
+  local gen_keys="$3"
 
-  validate_config "$file"
+  validate_config "$file" "$gen_keys"
 
   mkdir -p "$out_dir"
 
   for node in "${!NODE_NAMES[@]}"; do
     local iface="${MESH[interface]}"
     local address="${NODE_FIELDS[$node.address]:-}"
-    local private_key_path="${NODE_FIELDS[$node.private_key_path]:-/etc/wireguard/${iface}.key}"
     local private_key_value
-    private_key_value="$(resolve_private_key "$node")"
+    private_key_value="$(resolve_private_key "$node" "$out_dir" "$gen_keys")"
+    local private_key_path="${NODE_FIELDS[$node.private_key_path]:-/etc/wireguard/${iface}.key}"
     local listen_port="${MESH[port]:-51820}"
     local dns="${MESH[dns]:-}"
+
+    resolve_public_key "$node" "$out_dir" "$gen_keys" >/dev/null
 
     local out_file="$out_dir/${node}.conf"
     {
@@ -271,7 +357,8 @@ gen_configs() {
         if [[ "$peer" == "$node" ]]; then
           continue
         fi
-        local peer_key="${NODE_FIELDS[$peer.public_key]:-}"
+        local peer_key
+        peer_key="$(resolve_public_key "$peer" "$out_dir" "$gen_keys")"
         local peer_allowed="${NODE_FIELDS[$peer.allowed_ips]:-}"
         local peer_endpoint="${NODE_FIELDS[$peer.endpoint]:-}"
         local keepalive="${NODE_FIELDS[$peer.persistent_keepalive]:-}"
@@ -329,13 +416,14 @@ apply_config() {
   local out_dir="$3"
   local override_iface="$4"
   local dry_run="$5"
+  local gen_keys="$6"
 
   if [[ -z "$node" ]]; then
     echo "--node is required for apply" >&2
     exit 1
   fi
 
-  gen_configs "$file" "$out_dir"
+  gen_configs "$file" "$out_dir" "$gen_keys"
   load_config "$file"
 
   local iface="${MESH[interface]}"
@@ -368,6 +456,85 @@ apply_config() {
   echo "Applied config for $node to $target_conf"
 }
 
+apply_remote() {
+  local file="$1"
+  local node="$2"
+  local out_dir="$3"
+  local override_iface="$4"
+  local dry_run="$5"
+  local all_nodes="$6"
+  local gen_keys="$7"
+
+  if [[ "$all_nodes" != "true" && -z "$node" ]]; then
+    echo "--node or --all is required for apply-remote" >&2
+    exit 1
+  fi
+
+  gen_configs "$file" "$out_dir" "$gen_keys"
+  load_config "$file"
+
+  local iface="${MESH[interface]}"
+  if [[ -n "$override_iface" ]]; then
+    iface="$override_iface"
+  fi
+
+  local nodes_to_apply=()
+  if [[ "$all_nodes" == "true" ]]; then
+    for node_name in "${!NODE_NAMES[@]}"; do
+      nodes_to_apply+=("$node_name")
+    done
+  else
+    nodes_to_apply+=("$node")
+  fi
+
+  local failover_conf="$out_dir/wg-failover.conf"
+
+  for node_name in "${nodes_to_apply[@]}"; do
+    local source_conf="$out_dir/${node_name}.conf"
+    local ssh_port="${NODE_FIELDS[$node_name.ssh_port]:-}"
+    local ssh_target
+    ssh_target="$(resolve_ssh_target "$node_name")"
+
+    local ssh_cmd=(ssh)
+    local scp_cmd=(scp)
+    if [[ -n "$ssh_port" ]]; then
+      ssh_cmd+=(-p "$ssh_port")
+      scp_cmd+=(-P "$ssh_port")
+    fi
+
+    local remote_dir="/tmp/wgmesh-${node_name}"
+    local remote_conf="${remote_dir}/${iface}.conf"
+    local remote_failover="${remote_dir}/wg-failover.conf"
+    local target_conf="/etc/wireguard/${iface}.conf"
+    local target_failover="/etc/wireguard/wg-failover.conf"
+
+    if [[ "$dry_run" == "true" ]]; then
+      echo "Would copy $source_conf to $ssh_target:$remote_conf"
+      echo "Would copy $failover_conf to $ssh_target:$remote_failover"
+      echo "Would install to $target_conf and $target_failover on $ssh_target"
+      continue
+    fi
+
+    if [[ ! -f "$source_conf" ]]; then
+      echo "Config for node $node_name not found: $source_conf" >&2
+      exit 1
+    fi
+
+    "${ssh_cmd[@]}" "$ssh_target" "mkdir -p '$remote_dir'"
+    "${scp_cmd[@]}" "$source_conf" "$ssh_target:$remote_conf"
+    "${scp_cmd[@]}" "$failover_conf" "$ssh_target:$remote_failover"
+    "${ssh_cmd[@]}" "$ssh_target" \
+      "sudo install -m 0600 '$remote_conf' '$target_conf' && \
+       sudo install -m 0644 '$remote_failover' '$target_failover' && \
+       sudo systemctl enable --now 'wg-quick@${iface}.service' && \
+       sudo systemctl restart 'wg-quick@${iface}.service' && \
+       rm -f '$remote_conf' '$remote_failover' && \
+       rmdir '$remote_dir' 2>/dev/null || true"
+
+    echo "Applied config for $node_name to $ssh_target:$target_conf"
+  done
+}
+
 main() {
   if [[ $# -lt 1 ]]; then
     usage
@@ -382,6 +549,8 @@ main() {
   local node=""
   local override_iface=""
   local dry_run="false"
+  local all_nodes="false"
+  local gen_keys="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -405,6 +574,14 @@ main() {
         dry_run="true"
         shift
         ;;
+      --all)
+        all_nodes="true"
+        shift
+        ;;
+      --gen-keys)
+        gen_keys="true"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -419,16 +596,19 @@ main() {
 
   case "$cmd" in
     validate)
-      validate_config "$config"
+      validate_config "$config" "$gen_keys"
       ;;
     gen)
-      gen_configs "$config" "$out_dir"
+      gen_configs "$config" "$out_dir" "$gen_keys"
       ;;
     install-failover)
       install_failover
       ;;
     apply)
-      apply_config "$config" "$node" "$out_dir" "$override_iface" "$dry_run"
+      apply_config "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$gen_keys"
+      ;;
+    apply-remote)
+      apply_remote "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$all_nodes" "$gen_keys"
       ;;
     *)
       echo "Unknown command: $cmd" >&2
