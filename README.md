@@ -43,6 +43,38 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    sudo systemctl status wg-failover.timer
    ```
 
+## OS prerequisites
+
+### Ubuntu (systemd)
+
+Install WireGuard tools and ensure systemd is available:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y wireguard wireguard-tools
+```
+
+The `apply` and `install-failover` commands are designed for Linux hosts with
+systemd. They install configs under `/etc/wireguard` and manage services via
+`systemctl`.
+
+### macOS (local generation + manual import)
+
+macOS is supported for generating configs and manually importing them into the
+WireGuard app. Install the tools with Homebrew:
+
+```bash
+brew install wireguard-tools
+```
+
+Generate configs on macOS and then:
+
+- Import `<node>.conf` into the WireGuard app, **or**
+- Use `wg-quick up <path-to-conf>` if you have `wg-quick` available.
+
+The `install-failover` and `apply` commands assume systemd and are not intended
+for macOS.
+
 ## Inventory requirements
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
@@ -68,3 +100,16 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 - `wgmesh.sh apply` installs that file to `/etc/wireguard/wg-failover.conf`.
 - The `wg-failover` script checks the primary endpoint hostname reachability using `ping`.
 - If the primary host is unreachable and a secondary is reachable, it updates the peer endpoint via `wg set`.
+
+If a node does **not** define `endpoint_alt`, no automatic failover is possible
+for that peer.
+
+## Tailscale / endpoint guidance
+
+- If you want WireGuard to ride on **public IPs**, set `endpoint` to the public
+  IP/hostname and use `endpoint_alt` for a backup public address (if available).
+- If your servers are behind NAT or you manage them over Tailscale, you can use
+  Tailscale IPs/hostnames for `endpoint` and `endpoint_alt`. The failover check
+  still relies on ICMP reachability (`ping`) to those endpoints.
+- It is valid to keep management/SSH over Tailscale but keep WireGuard
+  endpoints on public IPs for data-plane traffic.
