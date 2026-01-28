@@ -43,6 +43,10 @@ parse_mesh_conf() {
   local file="$1"
   awk '
     function trim(s){gsub(/^[ \t]+|[ \t]+$/, "", s); return s}
+    function strip_comment(s){
+      sub(/[ \t]+#.*$/, "", s)
+      return s
+    }
     BEGIN{section=""; name=""}
     /^[ \t]*#/ {next}
     /^[ \t]*$/ {next}
@@ -60,9 +64,10 @@ parse_mesh_conf() {
       next
     }
     {
-      split($0, kv, "=")
+      line=strip_comment($0)
+      split(line, kv, "=")
       key=trim(kv[1])
-      val=substr($0, index($0, "=") + 1)
+      val=substr(line, index(line, "=") + 1)
       val=trim(val)
       if (section == "node") {
         printf("node|%s|%s|%s\n", name, tolower(key), val)
@@ -71,6 +76,24 @@ parse_mesh_conf() {
       }
     }
   ' "$file"
+}
+
+resolve_private_key() {
+  local node="$1"
+  local private_key="${NODE_FIELDS[$node.private_key]:-}"
+  local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
+
+  if [[ -n "$private_key" ]]; then
+    echo "$private_key"
+    return
+  fi
+
+  if [[ -n "$private_key_path" && -f "$private_key_path" ]]; then
+    cat "$private_key_path"
+    return
+  fi
+
+  echo "<PLACE_PRIVATE_KEY_HERE>"
 }
 
 validate_endpoint() {
@@ -227,6 +250,8 @@ gen_configs() {
     local iface="${MESH[interface]}"
     local address="${NODE_FIELDS[$node.address]:-}"
     local private_key_path="${NODE_FIELDS[$node.private_key_path]:-/etc/wireguard/${iface}.key}"
+    local private_key_value
+    private_key_value="$(resolve_private_key "$node")"
     local listen_port="${MESH[port]:-51820}"
     local dns="${MESH[dns]:-}"
 
@@ -234,7 +259,7 @@ gen_configs() {
     {
       echo "[Interface]"
       echo "Address = $address"
-      echo "PrivateKey = <PLACE_PRIVATE_KEY_HERE>"
+      echo "PrivateKey = $private_key_value"
       echo "# PrivateKey file: $private_key_path"
       echo "ListenPort = $listen_port"
       if [[ -n "$dns" ]]; then

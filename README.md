@@ -49,6 +49,7 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 - Each `[node "name"]` entry must include:
   - `address` (CIDR), `public_key`, `endpoint`, and `allowed_ips`.
 - `endpoint_alt` is optional but recommended for failover.
+- `private_key` or `private_key_path` can be provided to embed the key when generating configs.
 - `allowed_ips` may be a comma-delimited list of CIDRs.
 
 ## Validation behavior
