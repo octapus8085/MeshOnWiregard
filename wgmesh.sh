@@ -14,6 +14,9 @@ Commands:
   gen                      Generate WireGuard configs for all nodes.
   gen-keys                 Generate missing keypairs and write them to mesh.conf.
   install-failover         Install wg-failover script and systemd units.
+  install-exit-selector    Install wg-exit-selector script and systemd units.
+  uninstall-exit-selector  Remove wg-exit-selector script and systemd units.
+  exit-status              Show exit selector status on this host.
   apply                    Generate and install config for a single node.
   apply-remote             Apply config to remote node(s) over SSH.
 
@@ -40,6 +43,8 @@ Examples:
   ./wgmesh.sh gen-keys
   sudo ./wgmesh.sh apply --node alpha
   sudo ./wgmesh.sh install-failover
+  sudo ./wgmesh.sh install-exit-selector -c mesh.local.conf
+  sudo ./wgmesh.sh exit-status
   ./wgmesh.sh apply-remote --all
 USAGE
 }
@@ -49,6 +54,37 @@ trim() {
   s="${s#${s%%[![:space:]]*}}"
   s="${s%${s##*[![:space:]]}}"
   printf '%s' "$s"
+}
+
+split_csv() {
+  local input="$1"
+  local -n out_array="$2"
+  IFS=',' read -ra out_array <<< "$input"
+  local i
+  for i in "${!out_array[@]}"; do
+    out_array[$i]="$(trim "${out_array[$i]}")"
+  done
+  local filtered=()
+  for i in "${out_array[@]}"; do
+    if [[ -n "$i" ]]; then
+      filtered+=("$i")
+    fi
+  done
+  out_array=("${filtered[@]}")
+}
+
+list_contains_csv() {
+  local csv="$1"
+  local needle="$2"
+  local items=()
+  split_csv "$csv" items
+  local item
+  for item in "${items[@]}"; do
+    if [[ "$item" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 is_truthy() {
@@ -66,6 +102,54 @@ is_truthy() {
 is_placeholder() {
   local value="$1"
   [[ -n "$value" && "$value" =~ ^\<.*\>$ ]]
+}
+
+strip_cidr() {
+  local value="$1"
+  echo "${value%%/*}"
+}
+
+node_is_exit() {
+  local node="$1"
+  local exit_nodes="${MESH[exit_nodes]:-}"
+  if [[ -z "$exit_nodes" ]]; then
+    return 1
+  fi
+  list_contains_csv "$exit_nodes" "$node"
+}
+
+node_uses_exit_routing() {
+  local node="$1"
+  local enabled="${MESH[enable_exit_for_nodes]:-}"
+  if [[ -z "$enabled" ]]; then
+    return 1
+  fi
+  shopt -s nocasematch
+  if [[ "$enabled" =~ ^all$ ]]; then
+    shopt -u nocasematch
+    if node_is_exit "$node"; then
+      return 1
+    fi
+    return 0
+  fi
+  shopt -u nocasematch
+  list_contains_csv "$enabled" "$node"
+}
+
+mesh_ipv4_addresses() {
+  local addresses=()
+  local node_name
+  for node_name in "${!NODE_NAMES[@]}"; do
+    local address="${NODE_FIELDS[$node_name.address]:-}"
+    if [[ -z "$address" ]]; then
+      continue
+    fi
+    if [[ "$address" == *":"* ]]; then
+      continue
+    fi
+    addresses+=("$(strip_cidr "$address")")
+  done
+  printf '%s\n' "${addresses[@]}"
 }
 
 parse_mesh_conf() {
@@ -226,11 +310,21 @@ build_post_commands() {
   local phase="$2"
   local forwarding="${NODE_FIELDS[$node.forwarding]:-}"
   local nat_iface="${NODE_FIELDS[$node.nat_iface]:-}"
+  local exit_out_iface="${NODE_FIELDS[$node.exit_out_iface]:-}"
+  local enable_nat="${NODE_FIELDS[$node.enable_nat]:-}"
   local extra_up="${NODE_FIELDS[$node.post_up]:-}"
   local extra_down="${NODE_FIELDS[$node.post_down]:-}"
   local cmds=()
 
   if [[ "$phase" == "up" ]]; then
+    if node_is_exit "$node" && is_truthy "$enable_nat"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=1")
+      if [[ -n "$exit_out_iface" ]]; then
+        cmds+=("iptables -A FORWARD -i %i -o $exit_out_iface -j ACCEPT")
+        cmds+=("iptables -A FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        cmds+=("iptables -t nat -A POSTROUTING -o $exit_out_iface -j MASQUERADE")
+      fi
+    fi
     if is_truthy "$forwarding"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=1")
     fi
@@ -239,10 +333,34 @@ build_post_commands() {
       cmds+=("iptables -A FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
       cmds+=("iptables -t nat -A POSTROUTING -o $nat_iface -j MASQUERADE")
     fi
+    if node_uses_exit_routing "$node"; then
+      cmds+=("ip rule add pref 100 fwmark 0x1 lookup 100 2>/dev/null || true")
+      cmds+=("ip route replace default dev %i table 100")
+      local mesh_ip
+      while IFS= read -r mesh_ip; do
+        if [[ -n "$mesh_ip" ]]; then
+          cmds+=("ip route add ${mesh_ip}/32 dev %i 2>/dev/null || true")
+        fi
+      done < <(mesh_ipv4_addresses)
+      while IFS= read -r mesh_ip; do
+        if [[ -n "$mesh_ip" ]]; then
+          cmds+=("iptables -t mangle -C OUTPUT -d ${mesh_ip}/32 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -d ${mesh_ip}/32 -j RETURN")
+        fi
+      done < <(mesh_ipv4_addresses)
+      cmds+=("iptables -t mangle -C OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1")
+    fi
     if [[ -n "$extra_up" ]]; then
       cmds+=("$extra_up")
     fi
   else
+    if node_is_exit "$node" && is_truthy "$enable_nat"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=0")
+      if [[ -n "$exit_out_iface" ]]; then
+        cmds+=("iptables -D FORWARD -i %i -o $exit_out_iface -j ACCEPT")
+        cmds+=("iptables -D FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        cmds+=("iptables -t nat -D POSTROUTING -o $exit_out_iface -j MASQUERADE")
+      fi
+    fi
     if is_truthy "$forwarding"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=0")
     fi
@@ -250,6 +368,22 @@ build_post_commands() {
       cmds+=("iptables -D FORWARD -i %i -o $nat_iface -j ACCEPT")
       cmds+=("iptables -D FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
       cmds+=("iptables -t nat -D POSTROUTING -o $nat_iface -j MASQUERADE")
+    fi
+    if node_uses_exit_routing "$node"; then
+      cmds+=("iptables -t mangle -D OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1 2>/dev/null || true")
+      local mesh_ip
+      while IFS= read -r mesh_ip; do
+        if [[ -n "$mesh_ip" ]]; then
+          cmds+=("iptables -t mangle -D OUTPUT -d ${mesh_ip}/32 -j RETURN 2>/dev/null || true")
+        fi
+      done < <(mesh_ipv4_addresses)
+      while IFS= read -r mesh_ip; do
+        if [[ -n "$mesh_ip" ]]; then
+          cmds+=("ip route del ${mesh_ip}/32 dev %i 2>/dev/null || true")
+        fi
+      done < <(mesh_ipv4_addresses)
+      cmds+=("ip route del default dev %i table 100 2>/dev/null || true")
+      cmds+=("ip rule del pref 100 fwmark 0x1 lookup 100 2>/dev/null || true")
     fi
     if [[ -n "$extra_down" ]]; then
       cmds+=("$extra_down")
@@ -340,6 +474,88 @@ validate_config() {
     errors=$((errors + 1))
   fi
 
+  local exit_nodes="${MESH[exit_nodes]:-}"
+  local exit_primary="${MESH[exit_primary]:-}"
+  local exit_policy="${MESH[exit_policy]:-latency}"
+  local exit_check_interval="${MESH[exit_check_interval_seconds]:-}"
+  local exit_test_target="${MESH[exit_test_target]:-}"
+  local enable_exit_for_nodes="${MESH[enable_exit_for_nodes]:-}"
+
+  if [[ -n "$exit_nodes" || -n "$enable_exit_for_nodes" ]]; then
+    if [[ -z "$exit_nodes" ]]; then
+      echo "exit_nodes must be set in [mesh] when enable_exit_for_nodes is configured." >&2
+      errors=$((errors + 1))
+    fi
+    if [[ -z "$enable_exit_for_nodes" ]]; then
+      echo "enable_exit_for_nodes must be set in [mesh] when exit_nodes is configured." >&2
+      errors=$((errors + 1))
+    fi
+    if [[ -z "$exit_check_interval" ]]; then
+      echo "exit_check_interval_seconds must be set in [mesh] for exit routing." >&2
+      errors=$((errors + 1))
+    elif [[ ! "$exit_check_interval" =~ ^[0-9]+$ || "$exit_check_interval" -le 0 ]]; then
+      echo "exit_check_interval_seconds must be a positive integer: $exit_check_interval" >&2
+      errors=$((errors + 1))
+    fi
+    if [[ -n "$exit_policy" && ! "$exit_policy" =~ ^(latency|manual)$ ]]; then
+      echo "exit_policy must be latency or manual (got: $exit_policy)" >&2
+      errors=$((errors + 1))
+    fi
+    if [[ -n "$exit_test_target" && ! "$exit_test_target" =~ ^[0-9a-fA-F:.]+$ ]]; then
+      echo "exit_test_target must be an IP address (got: $exit_test_target)" >&2
+      errors=$((errors + 1))
+    fi
+    local exit_list=()
+    split_csv "$exit_nodes" exit_list
+    if [[ ${#exit_list[@]} -eq 0 ]]; then
+      echo "exit_nodes must include at least one node name." >&2
+      errors=$((errors + 1))
+    fi
+    local exit_node
+    for exit_node in "${exit_list[@]}"; do
+      if [[ -z "${NODE_NAMES[$exit_node]:-}" ]]; then
+        echo "exit_nodes includes unknown node: $exit_node" >&2
+        errors=$((errors + 1))
+        continue
+      fi
+      local exit_iface="${NODE_FIELDS[$exit_node.exit_out_iface]:-}"
+      local exit_nat="${NODE_FIELDS[$exit_node.enable_nat]:-}"
+      if [[ -z "$exit_iface" ]]; then
+        echo "Exit node $exit_node must define exit_out_iface." >&2
+        errors=$((errors + 1))
+      fi
+      if ! is_truthy "$exit_nat"; then
+        echo "Exit node $exit_node must set enable_nat = true." >&2
+        errors=$((errors + 1))
+      fi
+    done
+    if [[ -n "$exit_primary" && ! list_contains_csv "$exit_nodes" "$exit_primary" ]]; then
+      echo "exit_primary must be one of exit_nodes (got: $exit_primary)" >&2
+      errors=$((errors + 1))
+    fi
+    if [[ -n "$enable_exit_for_nodes" ]]; then
+      shopt -s nocasematch
+      if [[ "$enable_exit_for_nodes" =~ ^all$ ]]; then
+        shopt -u nocasematch
+      else
+        shopt -u nocasematch
+        local enabled_list=()
+        split_csv "$enable_exit_for_nodes" enabled_list
+        if [[ ${#enabled_list[@]} -eq 0 ]]; then
+          echo "enable_exit_for_nodes must list nodes or be 'all'." >&2
+          errors=$((errors + 1))
+        fi
+        local enabled_node
+        for enabled_node in "${enabled_list[@]}"; do
+          if [[ -z "${NODE_NAMES[$enabled_node]:-}" ]]; then
+            echo "enable_exit_for_nodes includes unknown node: $enabled_node" >&2
+            errors=$((errors + 1))
+          fi
+        done
+      fi
+    fi
+  fi
+
   declare -A seen_addresses=()
   declare -A seen_pubkeys=()
 
@@ -388,6 +604,12 @@ validate_config() {
           errors=$((errors + 1))
         fi
       done
+      if [[ -n "$exit_nodes" ]] && list_contains_csv "$exit_nodes" "$node_name"; then
+        if [[ "$allowed_ips" == *"0.0.0.0/0"* ]]; then
+          echo "Exit node $node_name allowed_ips must not include 0.0.0.0/0 when exit routing is enabled." >&2
+          errors=$((errors + 1))
+        fi
+      fi
     fi
 
     if [[ -n "$endpoint" ]] && ! validate_endpoint "$endpoint"; then
@@ -464,6 +686,9 @@ gen_configs() {
       echo "PrivateKey = $private_key_value"
       echo "# PrivateKey file: $private_key_path"
       echo "ListenPort = $listen_port"
+      if node_uses_exit_routing "$node_name"; then
+        echo "Table = off"
+      fi
       if [[ -n "$dns" ]]; then
         echo "DNS = $dns"
       fi
@@ -512,7 +737,78 @@ gen_configs() {
     echo ")"
   } > "$failover_file"
 
+  generate_exit_selector_files "$out_dir" "$gen_keys"
+
   echo "Generated configs in $out_dir"
+}
+
+generate_exit_selector_files() {
+  local out_dir="$1"
+  local gen_keys="$2"
+  local exit_nodes="${MESH[exit_nodes]:-}"
+  local enable_exit_for_nodes="${MESH[enable_exit_for_nodes]:-}"
+
+  if [[ -z "$exit_nodes" || -z "$enable_exit_for_nodes" ]]; then
+    return 0
+  fi
+
+  local exit_policy="${MESH[exit_policy]:-latency}"
+  local exit_primary="${MESH[exit_primary]:-}"
+  local exit_check_interval="${MESH[exit_check_interval_seconds]:-20}"
+  local exit_test_target="${MESH[exit_test_target]:-}"
+
+  local exit_conf="$out_dir/wg-exit-selector.conf"
+  {
+    echo "# Generated exit selector configuration"
+    echo "INTERFACE=${MESH[interface]}"
+    echo "EXIT_POLICY=${exit_policy}"
+    if [[ -n "$exit_primary" ]]; then
+      echo "EXIT_PRIMARY=${exit_primary}"
+    fi
+    echo "EXIT_CHECK_INTERVAL_SECONDS=${exit_check_interval}"
+    if [[ -n "$exit_test_target" ]]; then
+      echo "EXIT_TEST_TARGET=${exit_test_target}"
+    fi
+    echo "EXIT_NODES=("
+    local exit_list=()
+    split_csv "$exit_nodes" exit_list
+    local exit_node
+    for exit_node in "${exit_list[@]}"; do
+      local pubkey="${NODE_FIELDS[$exit_node.public_key]:-}"
+      local address="${NODE_FIELDS[$exit_node.address]:-}"
+      resolve_public_key "$exit_node" "$out_dir" "$gen_keys" >/dev/null || true
+      pubkey="${NODE_FIELDS[$exit_node.public_key]:-}"
+      address="$(strip_cidr "$address")"
+      echo "  \"${exit_node}|${pubkey}|${address}\""
+    done
+    echo ")"
+  } > "$exit_conf"
+
+  local exit_service="$out_dir/wg-exit-selector.service"
+  {
+    echo "[Unit]"
+    echo "Description=WireGuard exit selector"
+    echo "Wants=network-online.target"
+    echo "After=network-online.target"
+    echo ""
+    echo "[Service]"
+    echo "Type=oneshot"
+    echo "ExecStart=/usr/local/bin/wg-exit-selector"
+  } > "$exit_service"
+
+  local exit_timer="$out_dir/wg-exit-selector.timer"
+  {
+    echo "[Unit]"
+    echo "Description=Run WireGuard exit selector checks"
+    echo ""
+    echo "[Timer]"
+    echo "OnBootSec=30s"
+    echo "OnUnitActiveSec=${exit_check_interval}s"
+    echo "Unit=wg-exit-selector.service"
+    echo ""
+    echo "[Install]"
+    echo "WantedBy=timers.target"
+  } > "$exit_timer"
 }
 
 generate_keys_for_inventory() {
@@ -659,6 +955,54 @@ install_failover() {
   echo "Installed wg-failover templates. Enable with: systemctl enable --now wg-failover.timer"
 }
 
+install_exit_selector() {
+  local file="$1"
+  local out_dir="$2"
+  local gen_keys="$3"
+  local script_src="$ROOT_DIR/usr/local/bin/wg-exit-selector"
+
+  gen_configs "$file" "$out_dir" "$gen_keys"
+
+  local conf_src="$out_dir/wg-exit-selector.conf"
+  local service_src="$out_dir/wg-exit-selector.service"
+  local timer_src="$out_dir/wg-exit-selector.timer"
+
+  if [[ ! -f "$script_src" ]]; then
+    echo "Template not found: $script_src" >&2
+    exit 1
+  fi
+  if [[ ! -f "$conf_src" ]]; then
+    echo "Exit selector config not generated. Check exit routing settings in $file." >&2
+    exit 1
+  fi
+
+  install -m 0755 "$script_src" /usr/local/bin/wg-exit-selector
+  install -m 0644 "$conf_src" /etc/wireguard/wg-exit-selector.conf
+  install -m 0644 "$service_src" /etc/systemd/system/wg-exit-selector.service
+  install -m 0644 "$timer_src" /etc/systemd/system/wg-exit-selector.timer
+
+  systemctl daemon-reload
+  echo "Installed wg-exit-selector templates. Enable with: systemctl enable --now wg-exit-selector.timer"
+}
+
+uninstall_exit_selector() {
+  systemctl disable --now wg-exit-selector.timer >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/wg-exit-selector
+  rm -f /etc/systemd/system/wg-exit-selector.service
+  rm -f /etc/systemd/system/wg-exit-selector.timer
+  rm -f /etc/wireguard/wg-exit-selector.conf
+  systemctl daemon-reload || true
+  echo "Removed wg-exit-selector templates."
+}
+
+exit_status() {
+  if ! command -v /usr/local/bin/wg-exit-selector >/dev/null 2>&1; then
+    echo "wg-exit-selector is not installed on this host." >&2
+    exit 1
+  fi
+  /usr/local/bin/wg-exit-selector status
+}
+
 apply_config() {
   local file="$1"
   local node="$2"
@@ -688,10 +1032,24 @@ apply_config() {
   local target_conf="/etc/wireguard/${iface}.conf"
   local failover_conf="$out_dir/wg-failover.conf"
   local target_failover="/etc/wireguard/wg-failover.conf"
+  local exit_conf="$out_dir/wg-exit-selector.conf"
+  local exit_service="$out_dir/wg-exit-selector.service"
+  local exit_timer="$out_dir/wg-exit-selector.timer"
+  local exit_script="$ROOT_DIR/usr/local/bin/wg-exit-selector"
+  local target_exit_conf="/etc/wireguard/wg-exit-selector.conf"
+  local target_exit_service="/etc/systemd/system/wg-exit-selector.service"
+  local target_exit_timer="/etc/systemd/system/wg-exit-selector.timer"
+  local target_exit_script="/usr/local/bin/wg-exit-selector"
 
   if [[ "$dry_run" == "true" ]]; then
     echo "Would install $source_conf to $target_conf"
     echo "Would install $failover_conf to $target_failover"
+    if node_uses_exit_routing "$node"; then
+      echo "Would install $exit_conf to $target_exit_conf"
+      echo "Would install $exit_service to $target_exit_service"
+      echo "Would install $exit_timer to $target_exit_timer"
+      echo "Would install $exit_script to $target_exit_script"
+    fi
     return 0
   fi
 
@@ -702,6 +1060,19 @@ apply_config() {
 
   install -m 0600 "$source_conf" "$target_conf"
   install -m 0644 "$failover_conf" "$target_failover"
+
+  if node_uses_exit_routing "$node"; then
+    if [[ ! -f "$exit_conf" ]]; then
+      echo "Exit selector config not found: $exit_conf" >&2
+      exit 1
+    fi
+    install -m 0755 "$exit_script" "$target_exit_script"
+    install -m 0644 "$exit_conf" "$target_exit_conf"
+    install -m 0644 "$exit_service" "$target_exit_service"
+    install -m 0644 "$exit_timer" "$target_exit_timer"
+    systemctl daemon-reload
+    systemctl enable --now wg-exit-selector.timer
+  fi
 
   systemctl enable --now "wg-quick@${iface}.service"
   systemctl restart "wg-quick@${iface}.service"
@@ -721,6 +1092,7 @@ apply_remote() {
   local script_src="$ROOT_DIR/usr/local/bin/wg-failover"
   local service_src="$ROOT_DIR/wg-failover.service"
   local timer_src="$ROOT_DIR/wg-failover.timer"
+  local exit_script_src="$ROOT_DIR/usr/local/bin/wg-exit-selector"
 
   if [[ "$all_nodes" != "true" && -z "$node" ]]; then
     echo "--node or --all is required for apply-remote" >&2
@@ -732,6 +1104,10 @@ apply_remote() {
 
   if [[ ! -f "$script_src" ]]; then
     echo "Template not found: $script_src" >&2
+    exit 1
+  fi
+  if [[ ! -f "$exit_script_src" ]]; then
+    echo "Template not found: $exit_script_src" >&2
     exit 1
   fi
 
@@ -750,6 +1126,9 @@ apply_remote() {
   fi
 
   local failover_conf="$out_dir/wg-failover.conf"
+  local exit_conf="$out_dir/wg-exit-selector.conf"
+  local exit_service="$out_dir/wg-exit-selector.service"
+  local exit_timer="$out_dir/wg-exit-selector.timer"
 
   for node_name in "${nodes_to_apply[@]}"; do
     local source_conf="$out_dir/${node_name}.conf"
@@ -773,11 +1152,19 @@ apply_remote() {
     local remote_script="${remote_dir}/wg-failover"
     local remote_service="${remote_dir}/wg-failover.service"
     local remote_timer="${remote_dir}/wg-failover.timer"
+    local remote_exit_conf="${remote_dir}/wg-exit-selector.conf"
+    local remote_exit_script="${remote_dir}/wg-exit-selector"
+    local remote_exit_service="${remote_dir}/wg-exit-selector.service"
+    local remote_exit_timer="${remote_dir}/wg-exit-selector.timer"
     local target_conf="/etc/wireguard/${iface}.conf"
     local target_failover="/etc/wireguard/wg-failover.conf"
     local target_script="/usr/local/bin/wg-failover"
     local target_service="/etc/systemd/system/wg-failover.service"
     local target_timer="/etc/systemd/system/wg-failover.timer"
+    local target_exit_conf="/etc/wireguard/wg-exit-selector.conf"
+    local target_exit_script="/usr/local/bin/wg-exit-selector"
+    local target_exit_service="/etc/systemd/system/wg-exit-selector.service"
+    local target_exit_timer="/etc/systemd/system/wg-exit-selector.timer"
 
     if [[ "$dry_run" == "true" ]]; then
       echo "Would copy $source_conf to $ssh_target:$remote_conf"
@@ -785,7 +1172,15 @@ apply_remote() {
       echo "Would copy $script_src to $ssh_target:$remote_script"
       echo "Would copy $service_src to $ssh_target:$remote_service"
       echo "Would copy $timer_src to $ssh_target:$remote_timer"
-      echo "Would install to $target_conf, $target_failover, $target_script, $target_service, and $target_timer on $ssh_target"
+      if node_uses_exit_routing "$node_name"; then
+        echo "Would copy $exit_conf to $ssh_target:$remote_exit_conf"
+        echo "Would copy $exit_script_src to $ssh_target:$remote_exit_script"
+        echo "Would copy $exit_service to $ssh_target:$remote_exit_service"
+        echo "Would copy $exit_timer to $ssh_target:$remote_exit_timer"
+        echo "Would install to $target_conf, $target_failover, $target_script, $target_service, $target_timer, $target_exit_conf, $target_exit_script, $target_exit_service, and $target_exit_timer on $ssh_target"
+      else
+        echo "Would install to $target_conf, $target_failover, $target_script, $target_service, and $target_timer on $ssh_target"
+      fi
       continue
     fi
 
@@ -800,16 +1195,29 @@ apply_remote() {
     "${scp_cmd[@]}" "$script_src" "$ssh_target:$remote_script"
     "${scp_cmd[@]}" "$service_src" "$ssh_target:$remote_service"
     "${scp_cmd[@]}" "$timer_src" "$ssh_target:$remote_timer"
+    if node_uses_exit_routing "$node_name"; then
+      "${scp_cmd[@]}" "$exit_conf" "$ssh_target:$remote_exit_conf"
+      "${scp_cmd[@]}" "$exit_script_src" "$ssh_target:$remote_exit_script"
+      "${scp_cmd[@]}" "$exit_service" "$ssh_target:$remote_exit_service"
+      "${scp_cmd[@]}" "$exit_timer" "$ssh_target:$remote_exit_timer"
+    fi
     "${ssh_cmd[@]}" "$ssh_target" \
       "sudo install -m 0600 '$remote_conf' '$target_conf' && \
        sudo install -m 0644 '$remote_failover' '$target_failover' && \
        sudo install -m 0755 '$remote_script' '$target_script' && \
        sudo install -m 0644 '$remote_service' '$target_service' && \
        sudo install -m 0644 '$remote_timer' '$target_timer' && \
+       if [ -f '$remote_exit_conf' ]; then \
+         sudo install -m 0644 '$remote_exit_conf' '$target_exit_conf' && \
+         sudo install -m 0755 '$remote_exit_script' '$target_exit_script' && \
+         sudo install -m 0644 '$remote_exit_service' '$target_exit_service' && \
+         sudo install -m 0644 '$remote_exit_timer' '$target_exit_timer'; \
+       fi && \
        sudo systemctl daemon-reload && \
        sudo systemctl enable --now 'wg-quick@${iface}.service' && \
+       if [ -f '$target_exit_timer' ]; then sudo systemctl enable --now 'wg-exit-selector.timer'; fi && \
        sudo systemctl restart 'wg-quick@${iface}.service' && \
-       rm -f '$remote_conf' '$remote_failover' '$remote_script' '$remote_service' '$remote_timer' && \
+       rm -f '$remote_conf' '$remote_failover' '$remote_script' '$remote_service' '$remote_timer' '$remote_exit_conf' '$remote_exit_script' '$remote_exit_service' '$remote_exit_timer' && \
        rmdir '$remote_dir' 2>/dev/null || true"
 
     echo "Applied config for $node_name to $ssh_target:$target_conf"
@@ -892,6 +1300,15 @@ main() {
       ;;
     install-failover)
       install_failover
+      ;;
+    install-exit-selector)
+      install_exit_selector "$config" "$out_dir" "$gen_keys"
+      ;;
+    uninstall-exit-selector)
+      uninstall_exit_selector
+      ;;
+    exit-status)
+      exit_status
       ;;
     apply)
       apply_config "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$gen_keys"

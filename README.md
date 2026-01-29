@@ -10,6 +10,9 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 - `usr/local/bin/wg-failover`: Template failover helper script.
 - `wg-failover.service`: systemd unit for the failover check.
 - `wg-failover.timer`: systemd timer for periodic failover checks.
+- `usr/local/bin/wg-exit-selector`: Exit selector helper for smart egress routing.
+- `wg-exit-selector.service`: systemd unit for the exit selector.
+- `wg-exit-selector.timer`: systemd timer for periodic exit selection.
 
 ## Usage steps (exact)
 
@@ -53,11 +56,16 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ```bash
    sudo ./wgmesh.sh install-failover
    ```
-7. **Enable the timer**
+7. **Install the exit selector (optional, for exit routing)**
+   ```bash
+   sudo ./wgmesh.sh install-exit-selector -c mesh.local.conf
+   sudo systemctl enable --now wg-exit-selector.timer
+   ```
+8. **Enable the timer**
    ```bash
    sudo systemctl enable --now wg-failover.timer
    ```
-8. **Verify status**
+9. **Verify status**
    ```bash
    sudo systemctl status wg-quick@wg0.service
    sudo systemctl status wg-failover.timer
@@ -112,6 +120,16 @@ for macOS.
   - With `--gen-keys`, missing keys are generated with `wg genkey` and public keys are derived with `wg pubkey`.
   - With `gen-keys`, missing keys are generated and written back into the inventory file.
 - `allowed_ips` may be a comma-delimited list of CIDRs.
+- Optional exit-routing mesh fields (for smart internet forwarding):
+  - `exit_nodes` (comma-delimited list of exit-capable nodes),
+  - `exit_primary` (optional default exit node),
+  - `exit_policy` (`latency` or `manual`),
+  - `exit_check_interval_seconds` (timer interval),
+  - `exit_test_target` (optional IP for diagnostics),
+  - `enable_exit_for_nodes` (comma-delimited list of nodes or `all`).
+- Exit-node fields:
+  - `exit_out_iface` (egress interface name),
+  - `enable_nat` (set `true` to enable MASQUERADE + forwarding rules).
 
 ## Validation behavior
 
@@ -121,6 +139,7 @@ for macOS.
 - Confirm each node has the required fields.
 - Ensure addresses and public keys are unique.
 - Validate CIDR formatting and endpoint formats.
+- Validate exit routing settings (exit nodes, policy, NAT interface, timer interval).
 - Print a summary inventory.
 
 ## Failover behavior
@@ -133,6 +152,80 @@ for macOS.
 
 If a node does **not** define `endpoint_alt`, no automatic failover is possible
 for that peer.
+
+## Smart exit routing (full mesh)
+
+This repo can keep full-mesh connectivity intact while forwarding **internet
+traffic** through the cheapest/closest exit node. Mesh peer `AllowedIPs` remain
+`/32` addresses, and the exit default route (`0.0.0.0/0`) is applied dynamically
+by a selector service so only **one exit** is active at a time.
+
+### Inventory snippet
+
+```ini
+[mesh]
+exit_nodes = charlie,sierra
+exit_primary = charlie
+exit_policy = latency
+exit_check_interval_seconds = 20
+exit_test_target = 1.1.1.1
+enable_exit_for_nodes = all
+
+[node "charlie"]
+exit_out_iface = eth0
+enable_nat = true
+
+[node "sierra"]
+exit_out_iface = ens3
+enable_nat = true
+```
+
+### Behavior
+
+- **Exit nodes** get generated `PostUp`/`PostDown` commands that enable
+  `net.ipv4.ip_forward=1` and add iptables `FORWARD` + `MASQUERADE` rules on the
+  configured `exit_out_iface`.
+- **Exit-enabled nodes** get:
+  - `Table = off` to prevent wg-quick from managing routes.
+  - Policy routing in table `100`:
+    - mark non-mesh traffic with `fwmark 0x1`,
+    - `ip rule` sends the marked traffic to table `100`,
+    - `ip route` adds a default route via `wg0` in table `100`,
+    - mesh `/32` routes are added explicitly to keep mesh traffic local.
+- The **wg-exit-selector** service:
+  - measures reachability using WireGuard handshakes and ping to exit WG IPs,
+  - selects the lowest-latency reachable exit (or `exit_primary` in manual mode),
+  - updates `AllowedIPs` so only one exit peer carries `0.0.0.0/0`.
+  - reports the optional `exit_test_target` in `wg-exit-selector status`.
+
+### Install/enable
+
+`apply` and `apply-remote` will install the exit selector on nodes listed in
+`enable_exit_for_nodes`. You can also install it directly:
+
+```bash
+sudo ./wgmesh.sh install-exit-selector -c mesh.local.conf
+sudo systemctl enable --now wg-exit-selector.timer
+```
+
+### Manual override
+
+Create `/etc/wireguard/exit.override` with the exit node name (e.g. `charlie`)
+to force a specific exit.
+
+### Verify
+
+```bash
+ip rule show
+ip route show table 100
+wg show wg0 allowed-ips
+./wgmesh.sh exit-status
+sudo wg-exit-selector status
+curl ifconfig.me
+```
+
+**Limitations:** only one exit peer should advertise `0.0.0.0/0` at a time; the
+selector enforces that while keeping full-mesh peer connectivity unchanged.
 
 ## Policy-based routing for star (hub-and-spoke) topologies
 
