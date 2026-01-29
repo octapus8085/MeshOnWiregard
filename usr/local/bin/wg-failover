@@ -24,6 +24,42 @@ parse_endpoint() {
   printf '%s|%s' "$host" "$port"
 }
 
+resolve_host() {
+  local host="$1"
+  local resolved=""
+
+  if [[ -z "$host" ]]; then
+    echo ""
+    return
+  fi
+
+  if [[ "$host" == *":"* ]]; then
+    resolved="$(getent ahostsv6 "$host" 2>/dev/null | awk 'NR==1 {print $1}')"
+  else
+    resolved="$(getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1 {print $1}')"
+  fi
+
+  if [[ -n "$resolved" ]]; then
+    echo "$resolved"
+  else
+    echo "$host"
+  fi
+}
+
+normalize_endpoint() {
+  local endpoint="$1"
+  local host=""
+  local port=""
+
+  IFS='|' read -r host port <<< "$(parse_endpoint "$endpoint")"
+  host="$(resolve_host "$host")"
+  if [[ "$host" == *":"* ]]; then
+    printf '[%s]:%s' "$host" "$port"
+  else
+    printf '%s:%s' "$host" "$port"
+  fi
+}
+
 is_reachable() {
   local host="$1"
   if [[ -z "$host" ]]; then
@@ -47,6 +83,13 @@ apply_endpoint() {
   fi
 
   wg set "$iface" peer "$pubkey" endpoint "$endpoint"
+}
+
+current_endpoint() {
+  local iface="$1"
+  local pubkey="$2"
+
+  wg show "$iface" endpoints 2>/dev/null | awk -v key="$pubkey" '$1 == key {print $2}'
 }
 
 main() {
@@ -75,17 +118,27 @@ main() {
       continue
     fi
 
+    current="$(current_endpoint "$INTERFACE" "$pubkey")"
+    normalized_primary="$(normalize_endpoint "$primary")"
     IFS='|' read -r host _ <<< "$(parse_endpoint "$primary")"
     if is_reachable "$host"; then
-      apply_endpoint "$INTERFACE" "$pubkey" "$primary"
+      if [[ -n "$current" && "$current" != "$normalized_primary" ]]; then
+        log "Restoring $name to $primary"
+        apply_endpoint "$INTERFACE" "$pubkey" "$primary"
+        exit 0
+      fi
       continue
     fi
 
     if [[ -n "$secondary" ]]; then
+      normalized_secondary="$(normalize_endpoint "$secondary")"
       IFS='|' read -r alt_host _ <<< "$(parse_endpoint "$secondary")"
       if is_reachable "$alt_host"; then
-        log "Failing over $name to $secondary"
-        apply_endpoint "$INTERFACE" "$pubkey" "$secondary"
+        if [[ "$current" != "$normalized_secondary" ]]; then
+          log "Failing over $name to $secondary"
+          apply_endpoint "$INTERFACE" "$pubkey" "$secondary"
+          exit 0
+        fi
       else
         log "Both endpoints unreachable for $name"
       fi
