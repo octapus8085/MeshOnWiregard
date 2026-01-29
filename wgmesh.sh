@@ -251,12 +251,13 @@ load_config() {
 
 print_inventory() {
   echo "Inventory:"
-  for node in "${!NODE_NAMES[@]}"; do
-    local address="${NODE_FIELDS[$node.address]:-}"
-    local endpoint="${NODE_FIELDS[$node.endpoint]:-}"
-    local endpoint_alt="${NODE_FIELDS[$node.endpoint_alt]:-}"
-    local allowed_ips="${NODE_FIELDS[$node.allowed_ips]:-}"
-    printf '  - %s\n' "$node"
+  local node_name
+  for node_name in "${!NODE_NAMES[@]}"; do
+    local address="${NODE_FIELDS[$node_name.address]:-}"
+    local endpoint="${NODE_FIELDS[$node_name.endpoint]:-}"
+    local endpoint_alt="${NODE_FIELDS[$node_name.endpoint_alt]:-}"
+    local allowed_ips="${NODE_FIELDS[$node_name.allowed_ips]:-}"
+    printf '  - %s\n' "$node_name"
     printf '    address: %s\n' "$address"
     printf '    endpoint: %s\n' "$endpoint"
     if [[ -n "$endpoint_alt" ]]; then
@@ -286,15 +287,16 @@ validate_config() {
   declare -A seen_addresses=()
   declare -A seen_pubkeys=()
 
-  for node in "${!NODE_NAMES[@]}"; do
-    local address="${NODE_FIELDS[$node.address]:-}"
-    local public_key="${NODE_FIELDS[$node.public_key]:-}"
-    local endpoint="${NODE_FIELDS[$node.endpoint]:-}"
-    local endpoint_alt="${NODE_FIELDS[$node.endpoint_alt]:-}"
-    local allowed_ips="${NODE_FIELDS[$node.allowed_ips]:-}"
+  local node_name
+  for node_name in "${!NODE_NAMES[@]}"; do
+    local address="${NODE_FIELDS[$node_name.address]:-}"
+    local public_key="${NODE_FIELDS[$node_name.public_key]:-}"
+    local endpoint="${NODE_FIELDS[$node_name.endpoint]:-}"
+    local endpoint_alt="${NODE_FIELDS[$node_name.endpoint_alt]:-}"
+    local allowed_ips="${NODE_FIELDS[$node_name.allowed_ips]:-}"
 
     if [[ -z "$address" || -z "$endpoint" || -z "$allowed_ips" ]]; then
-      echo "Node $node missing required fields (address, endpoint, allowed_ips)" >&2
+      echo "Node $node_name missing required fields (address, endpoint, allowed_ips)" >&2
       errors=$((errors + 1))
     fi
 
@@ -302,22 +304,22 @@ validate_config() {
       public_key=""
     fi
     if [[ -z "$public_key" && "$gen_keys" != "true" ]]; then
-      local private_key="${NODE_FIELDS[$node.private_key]:-}"
-      local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
+      local private_key="${NODE_FIELDS[$node_name.private_key]:-}"
+      local private_key_path="${NODE_FIELDS[$node_name.private_key_path]:-}"
       if [[ -z "$private_key" && -n "$private_key_path" && -f "$private_key_path" ]]; then
         private_key="present"
       fi
       if [[ -z "$private_key" ]]; then
-        echo "Node $node missing required field: public_key" >&2
+        echo "Node $node_name missing required field: public_key" >&2
         errors=$((errors + 1))
       elif ! command -v wg >/dev/null 2>&1; then
-        echo "Node $node needs wg to derive public_key from private_key." >&2
+        echo "Node $node_name needs wg to derive public_key from private_key." >&2
         errors=$((errors + 1))
       fi
     fi
 
     if [[ -n "$address" ]] && ! validate_cidr "$address"; then
-      echo "Node $node address is not CIDR: $address" >&2
+      echo "Node $node_name address is not CIDR: $address" >&2
       errors=$((errors + 1))
     fi
 
@@ -326,19 +328,19 @@ validate_config() {
       for ip in "${ips[@]}"; do
         ip="$(trim "$ip")"
         if [[ -n "$ip" ]] && ! validate_cidr "$ip"; then
-          echo "Node $node allowed_ips contains non-CIDR entry: $ip" >&2
+          echo "Node $node_name allowed_ips contains non-CIDR entry: $ip" >&2
           errors=$((errors + 1))
         fi
       done
     fi
 
     if [[ -n "$endpoint" ]] && ! validate_endpoint "$endpoint"; then
-      echo "Node $node endpoint is invalid: $endpoint" >&2
+      echo "Node $node_name endpoint is invalid: $endpoint" >&2
       errors=$((errors + 1))
     fi
 
     if [[ -n "$endpoint_alt" ]] && ! validate_endpoint "$endpoint_alt"; then
-      echo "Node $node endpoint_alt is invalid: $endpoint_alt" >&2
+      echo "Node $node_name endpoint_alt is invalid: $endpoint_alt" >&2
       errors=$((errors + 1))
     fi
 
@@ -353,7 +355,7 @@ validate_config() {
 
     if [[ -n "$public_key" ]]; then
       if [[ -n "${seen_pubkeys[$public_key]:-}" ]]; then
-        echo "Duplicate public_key for node $node" >&2
+        echo "Duplicate public_key for node $node_name" >&2
         errors=$((errors + 1))
       else
         seen_pubkeys[$public_key]=1
@@ -383,18 +385,19 @@ gen_configs() {
 
   mkdir -p "$out_dir"
 
-  for node in "${!NODE_NAMES[@]}"; do
+  local node_name
+  for node_name in "${!NODE_NAMES[@]}"; do
     local iface="${MESH[interface]}"
-    local address="${NODE_FIELDS[$node.address]:-}"
+    local address="${NODE_FIELDS[$node_name.address]:-}"
     local private_key_value
-    private_key_value="$(resolve_private_key "$node" "$out_dir" "$gen_keys")"
-    local private_key_path="${NODE_FIELDS[$node.private_key_path]:-/etc/wireguard/${iface}.key}"
+    private_key_value="$(resolve_private_key "$node_name" "$out_dir" "$gen_keys")"
+    local private_key_path="${NODE_FIELDS[$node_name.private_key_path]:-/etc/wireguard/${iface}.key}"
     local listen_port="${MESH[port]:-51820}"
     local dns="${MESH[dns]:-}"
 
-    resolve_public_key "$node" "$out_dir" "$gen_keys" >/dev/null
+    resolve_public_key "$node_name" "$out_dir" "$gen_keys" >/dev/null
 
-    local out_file="$out_dir/${node}.conf"
+    local out_file="$out_dir/${node_name}.conf"
     {
       echo "[Interface]"
       echo "Address = $address"
@@ -407,7 +410,7 @@ gen_configs() {
       echo ""
 
       for peer in "${!NODE_NAMES[@]}"; do
-        if [[ "$peer" == "$node" ]]; then
+        if [[ "$peer" == "$node_name" ]]; then
           continue
         fi
         local peer_key
@@ -433,11 +436,12 @@ gen_configs() {
     echo "# Generated failover configuration"
     echo "INTERFACE=${MESH[interface]}"
     echo "PEERS=("
-    for node in "${!NODE_NAMES[@]}"; do
-      local pubkey="${NODE_FIELDS[$node.public_key]:-}"
-      local primary="${NODE_FIELDS[$node.endpoint]:-}"
-      local secondary="${NODE_FIELDS[$node.endpoint_alt]:-}"
-      echo "  \"$node|$pubkey|$primary|$secondary\""
+    local node_name
+    for node_name in "${!NODE_NAMES[@]}"; do
+      local pubkey="${NODE_FIELDS[$node_name.public_key]:-}"
+      local primary="${NODE_FIELDS[$node_name.endpoint]:-}"
+      local secondary="${NODE_FIELDS[$node_name.endpoint_alt]:-}"
+      echo "  \"$node_name|$pubkey|$primary|$secondary\""
     done
     echo ")"
   } > "$failover_file"
@@ -459,19 +463,20 @@ generate_keys_for_inventory() {
   local keyfile
   keyfile="$(mktemp)"
 
-  for node in "${!NODE_NAMES[@]}"; do
+  local node_name
+  for node_name in "${!NODE_NAMES[@]}"; do
     local private_key
     local public_key
-    private_key="$(resolve_private_key "$node" "$out_dir" "true")"
-    public_key="$(resolve_public_key "$node" "$out_dir" "true")"
+    private_key="$(resolve_private_key "$node_name" "$out_dir" "true")"
+    public_key="$(resolve_public_key "$node_name" "$out_dir" "true")"
 
     if [[ "$private_key" == "<PLACE_PRIVATE_KEY_HERE>" || -z "$public_key" ]]; then
-      echo "Failed to generate keys for $node." >&2
+      echo "Failed to generate keys for $node_name." >&2
       rm -f "$keyfile"
       exit 1
     fi
 
-    printf '%s\t%s\t%s\n' "$node" "$private_key" "$public_key" >> "$keyfile"
+    printf '%s\t%s\t%s\n' "$node_name" "$private_key" "$public_key" >> "$keyfile"
   done
 
   local python_bin="python"
