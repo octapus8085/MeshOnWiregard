@@ -51,6 +51,18 @@ trim() {
   printf '%s' "$s"
 }
 
+is_truthy() {
+  local value
+  value="$(trim "${1:-}")"
+  shopt -s nocasematch
+  if [[ "$value" =~ ^(true|yes|1)$ ]]; then
+    shopt -u nocasematch
+    return 0
+  fi
+  shopt -u nocasematch
+  return 1
+}
+
 is_placeholder() {
   local value="$1"
   [[ -n "$value" && "$value" =~ ^\<.*\>$ ]]
@@ -207,6 +219,50 @@ resolve_public_key() {
   fi
 
   echo ""
+}
+
+build_post_commands() {
+  local node="$1"
+  local phase="$2"
+  local forwarding="${NODE_FIELDS[$node.forwarding]:-}"
+  local nat_iface="${NODE_FIELDS[$node.nat_iface]:-}"
+  local extra_up="${NODE_FIELDS[$node.post_up]:-}"
+  local extra_down="${NODE_FIELDS[$node.post_down]:-}"
+  local cmds=()
+
+  if [[ "$phase" == "up" ]]; then
+    if is_truthy "$forwarding"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=1")
+    fi
+    if [[ -n "$nat_iface" ]]; then
+      cmds+=("iptables -A FORWARD -i %i -o $nat_iface -j ACCEPT")
+      cmds+=("iptables -A FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+      cmds+=("iptables -t nat -A POSTROUTING -o $nat_iface -j MASQUERADE")
+    fi
+    if [[ -n "$extra_up" ]]; then
+      cmds+=("$extra_up")
+    fi
+  else
+    if is_truthy "$forwarding"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=0")
+    fi
+    if [[ -n "$nat_iface" ]]; then
+      cmds+=("iptables -D FORWARD -i %i -o $nat_iface -j ACCEPT")
+      cmds+=("iptables -D FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+      cmds+=("iptables -t nat -D POSTROUTING -o $nat_iface -j MASQUERADE")
+    fi
+    if [[ -n "$extra_down" ]]; then
+      cmds+=("$extra_down")
+    fi
+  fi
+
+  if [[ ${#cmds[@]} -eq 0 ]]; then
+    echo ""
+    return
+  fi
+
+  local IFS='; '
+  echo "${cmds[*]}"
 }
 
 validate_endpoint() {
@@ -394,6 +450,10 @@ gen_configs() {
     local private_key_path="${NODE_FIELDS[$node_name.private_key_path]:-/etc/wireguard/${iface}.key}"
     local listen_port="${MESH[port]:-51820}"
     local dns="${MESH[dns]:-}"
+    local post_up
+    local post_down
+    post_up="$(build_post_commands "$node_name" "up")"
+    post_down="$(build_post_commands "$node_name" "down")"
 
     resolve_public_key "$node_name" "$out_dir" "$gen_keys" >/dev/null
 
@@ -406,6 +466,12 @@ gen_configs() {
       echo "ListenPort = $listen_port"
       if [[ -n "$dns" ]]; then
         echo "DNS = $dns"
+      fi
+      if [[ -n "$post_up" ]]; then
+        echo "PostUp = $post_up"
+      fi
+      if [[ -n "$post_down" ]]; then
+        echo "PostDown = $post_down"
       fi
       echo ""
 
