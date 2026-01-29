@@ -243,6 +243,9 @@ build_post_commands() {
       cmds+=("$extra_up")
     fi
   else
+    if is_truthy "$forwarding"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=0")
+    fi
     if [[ -n "$nat_iface" ]]; then
       cmds+=("iptables -D FORWARD -i %i -o $nat_iface -j ACCEPT")
       cmds+=("iptables -D FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
