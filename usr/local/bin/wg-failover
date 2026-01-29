@@ -49,6 +49,13 @@ apply_endpoint() {
   wg set "$iface" peer "$pubkey" endpoint "$endpoint"
 }
 
+current_endpoint() {
+  local iface="$1"
+  local pubkey="$2"
+
+  wg show "$iface" endpoints 2>/dev/null | awk -v key="$pubkey" '$1 == key {print $2}'
+}
+
 main() {
   if [[ ! -f "$CONFIG_FILE" ]]; then
     log "Missing config: $CONFIG_FILE"
@@ -75,17 +82,25 @@ main() {
       continue
     fi
 
+    current="$(current_endpoint "$INTERFACE" "$pubkey")"
     IFS='|' read -r host _ <<< "$(parse_endpoint "$primary")"
     if is_reachable "$host"; then
-      apply_endpoint "$INTERFACE" "$pubkey" "$primary"
+      if [[ -n "$current" && "$current" != "$primary" ]]; then
+        log "Restoring $name to $primary"
+        apply_endpoint "$INTERFACE" "$pubkey" "$primary"
+        exit 0
+      fi
       continue
     fi
 
     if [[ -n "$secondary" ]]; then
       IFS='|' read -r alt_host _ <<< "$(parse_endpoint "$secondary")"
       if is_reachable "$alt_host"; then
-        log "Failing over $name to $secondary"
-        apply_endpoint "$INTERFACE" "$pubkey" "$secondary"
+        if [[ "$current" != "$secondary" ]]; then
+          log "Failing over $name to $secondary"
+          apply_endpoint "$INTERFACE" "$pubkey" "$secondary"
+          exit 0
+        fi
       else
         log "Both endpoints unreachable for $name"
       fi
