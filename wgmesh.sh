@@ -652,6 +652,9 @@ apply_remote() {
   local all_nodes="$6"
   local gen_keys="$7"
   local ssh_tty="$8"
+  local script_src="$ROOT_DIR/usr/local/bin/wg-failover"
+  local service_src="$ROOT_DIR/wg-failover.service"
+  local timer_src="$ROOT_DIR/wg-failover.timer"
 
   if [[ "$all_nodes" != "true" && -z "$node" ]]; then
     echo "--node or --all is required for apply-remote" >&2
@@ -660,6 +663,11 @@ apply_remote() {
 
   gen_configs "$file" "$out_dir" "$gen_keys"
   load_config "$file"
+
+  if [[ ! -f "$script_src" ]]; then
+    echo "Template not found: $script_src" >&2
+    exit 1
+  fi
 
   local iface="${MESH[interface]}"
   if [[ -n "$override_iface" ]]; then
@@ -696,13 +704,22 @@ apply_remote() {
     local remote_dir="/tmp/wgmesh-${node_name}"
     local remote_conf="${remote_dir}/${iface}.conf"
     local remote_failover="${remote_dir}/wg-failover.conf"
+    local remote_script="${remote_dir}/wg-failover"
+    local remote_service="${remote_dir}/wg-failover.service"
+    local remote_timer="${remote_dir}/wg-failover.timer"
     local target_conf="/etc/wireguard/${iface}.conf"
     local target_failover="/etc/wireguard/wg-failover.conf"
+    local target_script="/usr/local/bin/wg-failover"
+    local target_service="/etc/systemd/system/wg-failover.service"
+    local target_timer="/etc/systemd/system/wg-failover.timer"
 
     if [[ "$dry_run" == "true" ]]; then
       echo "Would copy $source_conf to $ssh_target:$remote_conf"
       echo "Would copy $failover_conf to $ssh_target:$remote_failover"
-      echo "Would install to $target_conf and $target_failover on $ssh_target"
+      echo "Would copy $script_src to $ssh_target:$remote_script"
+      echo "Would copy $service_src to $ssh_target:$remote_service"
+      echo "Would copy $timer_src to $ssh_target:$remote_timer"
+      echo "Would install to $target_conf, $target_failover, $target_script, $target_service, and $target_timer on $ssh_target"
       continue
     fi
 
@@ -714,12 +731,19 @@ apply_remote() {
     "${ssh_cmd[@]}" "$ssh_target" "mkdir -p '$remote_dir'"
     "${scp_cmd[@]}" "$source_conf" "$ssh_target:$remote_conf"
     "${scp_cmd[@]}" "$failover_conf" "$ssh_target:$remote_failover"
+    "${scp_cmd[@]}" "$script_src" "$ssh_target:$remote_script"
+    "${scp_cmd[@]}" "$service_src" "$ssh_target:$remote_service"
+    "${scp_cmd[@]}" "$timer_src" "$ssh_target:$remote_timer"
     "${ssh_cmd[@]}" "$ssh_target" \
       "sudo install -m 0600 '$remote_conf' '$target_conf' && \
        sudo install -m 0644 '$remote_failover' '$target_failover' && \
+       sudo install -m 0755 '$remote_script' '$target_script' && \
+       sudo install -m 0644 '$remote_service' '$target_service' && \
+       sudo install -m 0644 '$remote_timer' '$target_timer' && \
+       sudo systemctl daemon-reload && \
        sudo systemctl enable --now 'wg-quick@${iface}.service' && \
        sudo systemctl restart 'wg-quick@${iface}.service' && \
-       rm -f '$remote_conf' '$remote_failover' && \
+       rm -f '$remote_conf' '$remote_failover' '$remote_script' '$remote_service' '$remote_timer' && \
        rmdir '$remote_dir' 2>/dev/null || true"
 
     echo "Applied config for $node_name to $ssh_target:$target_conf"

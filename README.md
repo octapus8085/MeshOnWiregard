@@ -39,6 +39,7 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ```bash
    ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all
    ```
+   This also installs the failover helper and systemd units on the remote host.
    If your remote `sudo` requires a TTY (common with `requiretty`), add:
    ```bash
    ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all --ssh-tty
@@ -127,7 +128,8 @@ for macOS.
 - `wgmesh.sh gen` writes a `wg-failover.conf` file in the output directory.
 - `wgmesh.sh apply` installs that file to `/etc/wireguard/wg-failover.conf`.
 - The `wg-failover` script checks the primary endpoint hostname reachability using `ping`.
-- If the primary host is unreachable and a secondary is reachable, it updates the peer endpoint via `wg set`.
+- If the primary host is unreachable and a secondary is reachable, it updates a single peer endpoint via `wg set` per run.
+- When the primary becomes reachable again, it restores that peer on a subsequent run (one peer at a time).
 
 If a node does **not** define `endpoint_alt`, no automatic failover is possible
 for that peer.
