@@ -155,6 +155,23 @@ resolve_public_key() {
     return
   fi
 
+  local private_key="${NODE_FIELDS[$node.private_key]:-}"
+  local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
+  if [[ -z "$private_key" && -n "$private_key_path" && -f "$private_key_path" ]]; then
+    private_key="$(cat "$private_key_path")"
+  fi
+
+  if [[ -n "$private_key" ]]; then
+    if ! command -v wg >/dev/null 2>&1; then
+      echo "wg is required to derive public keys but was not found in PATH." >&2
+      exit 1
+    fi
+    public_key="$(printf '%s' "$private_key" | wg pubkey)"
+    NODE_FIELDS["$node.public_key"]="$public_key"
+    echo "$public_key"
+    return
+  fi
+
   if [[ "$gen_keys" == "true" ]]; then
     if ! command -v wg >/dev/null 2>&1; then
       echo "wg is required to generate public keys but was not found in PATH." >&2
@@ -265,8 +282,18 @@ validate_config() {
     fi
 
     if [[ -z "$public_key" && "$gen_keys" != "true" ]]; then
-      echo "Node $node missing required field: public_key" >&2
-      errors=$((errors + 1))
+      local private_key="${NODE_FIELDS[$node.private_key]:-}"
+      local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
+      if [[ -z "$private_key" && -n "$private_key_path" && -f "$private_key_path" ]]; then
+        private_key="present"
+      fi
+      if [[ -z "$private_key" ]]; then
+        echo "Node $node missing required field: public_key" >&2
+        errors=$((errors + 1))
+      elif ! command -v wg >/dev/null 2>&1; then
+        echo "Node $node needs wg to derive public_key from private_key." >&2
+        errors=$((errors + 1))
+      fi
     fi
 
     if [[ -n "$address" ]] && ! validate_cidr "$address"; then
@@ -327,6 +354,10 @@ gen_configs() {
   local file="$1"
   local out_dir="$2"
   local gen_keys="$3"
+
+  if [[ "$gen_keys" == "true" ]]; then
+    generate_keys_for_inventory "$file" "$out_dir"
+  fi
 
   validate_config "$file" "$gen_keys"
 
