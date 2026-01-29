@@ -51,6 +51,11 @@ trim() {
   printf '%s' "$s"
 }
 
+is_placeholder() {
+  local value="$1"
+  [[ -n "$value" && "$value" =~ ^<.*>$ ]]
+}
+
 parse_mesh_conf() {
   local file="$1"
   awk '
@@ -97,7 +102,11 @@ resolve_private_key() {
   local private_key="${NODE_FIELDS[$node.private_key]:-}"
   local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
 
-  if [[ -n "$private_key" ]]; then
+  if is_placeholder "$private_key"; then
+    private_key=""
+  fi
+
+  if [[ -n "$private_key" ]] && ! is_placeholder "$private_key"; then
     echo "$private_key"
     return
   fi
@@ -151,13 +160,20 @@ resolve_public_key() {
   local gen_keys="$3"
   local public_key="${NODE_FIELDS[$node.public_key]:-}"
 
-  if [[ -n "$public_key" ]]; then
+  if is_placeholder "$public_key"; then
+    public_key=""
+  fi
+
+  if [[ -n "$public_key" ]] && ! is_placeholder "$public_key"; then
     echo "$public_key"
     return
   fi
 
   local private_key="${NODE_FIELDS[$node.private_key]:-}"
   local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
+  if is_placeholder "$private_key"; then
+    private_key=""
+  fi
   if [[ -z "$private_key" && -n "$private_key_path" && -f "$private_key_path" ]]; then
     private_key="$(cat "$private_key_path")"
   fi
@@ -282,6 +298,9 @@ validate_config() {
       errors=$((errors + 1))
     fi
 
+    if [[ -n "$public_key" ]] && is_placeholder "$public_key"; then
+      public_key=""
+    fi
     if [[ -z "$public_key" && "$gen_keys" != "true" ]]; then
       local private_key="${NODE_FIELDS[$node.private_key]:-}"
       local private_key_path="${NODE_FIELDS[$node.private_key_path]:-}"
@@ -484,6 +503,8 @@ with open(key_path, "r", encoding="utf-8") as handle:
 
 section_re = re.compile(r'^\s*\[\s*node\s+"?([^"]+)"?\s*\]\s*$', re.IGNORECASE)
 key_re = re.compile(r'^\s*(private_key|public_key)\s*=', re.IGNORECASE)
+blank_re = re.compile(r'^\s*$')
+comment_re = re.compile(r'^\s*#')
 
 lines = []
 with open(config_path, "r", encoding="utf-8") as handle:
@@ -493,6 +514,12 @@ output = []
 current_node = None
 seen_private = False
 seen_public = False
+pending = []
+
+def flush_pending():
+    if pending:
+        output.extend(pending)
+        pending.clear()
 
 def flush_missing():
     if current_node and current_node in keys:
@@ -500,6 +527,7 @@ def flush_missing():
             output.append(f"private_key = {keys[current_node]['private_key']}")
         if not seen_public:
             output.append(f"public_key = {keys[current_node]['public_key']}")
+    flush_pending()
 
 for line in lines:
     section_match = section_re.match(line)
@@ -510,6 +538,12 @@ for line in lines:
         seen_public = False
         output.append(line)
         continue
+
+    if current_node and (blank_re.match(line) or comment_re.match(line)):
+        pending.append(line)
+        continue
+
+    flush_pending()
 
     if current_node and key_re.match(line):
         key_name = key_re.match(line).group(1).lower()
