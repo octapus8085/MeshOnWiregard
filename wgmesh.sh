@@ -12,6 +12,7 @@ Usage: wgmesh.sh <command> [options]
 Commands:
   validate                 Validate mesh.conf inventory and required fields.
   gen                      Generate WireGuard configs for all nodes.
+  gen-keys                 Generate missing keypairs and write them to mesh.conf.
   install-failover         Install wg-failover script and systemd units.
   apply                    Generate and install config for a single node.
   apply-remote             Apply config to remote node(s) over SSH.
@@ -35,6 +36,7 @@ Options (apply-remote):
 Examples:
   ./wgmesh.sh validate
   ./wgmesh.sh gen -o ./out
+  ./wgmesh.sh gen-keys
   sudo ./wgmesh.sh apply --node alpha
   sudo ./wgmesh.sh install-failover
   ./wgmesh.sh apply-remote --all
@@ -392,6 +394,106 @@ gen_configs() {
   echo "Generated configs in $out_dir"
 }
 
+generate_keys_for_inventory() {
+  local file="$1"
+  local out_dir="$2"
+
+  load_config "$file"
+
+  if ! command -v wg >/dev/null 2>&1; then
+    echo "wg is required to generate keys but was not found in PATH." >&2
+    exit 1
+  fi
+
+  local keyfile
+  keyfile="$(mktemp)"
+
+  for node in "${!NODE_NAMES[@]}"; do
+    local private_key
+    local public_key
+    private_key="$(resolve_private_key "$node" "$out_dir" "true")"
+    public_key="$(resolve_public_key "$node" "$out_dir" "true")"
+
+    if [[ "$private_key" == "<PLACE_PRIVATE_KEY_HERE>" || -z "$public_key" ]]; then
+      echo "Failed to generate keys for $node." >&2
+      rm -f "$keyfile"
+      exit 1
+    fi
+
+    printf '%s\t%s\t%s\n' "$node" "$private_key" "$public_key" >> "$keyfile"
+  done
+
+  python - "$file" "$keyfile" <<'PY'
+import os
+import re
+import sys
+
+config_path = sys.argv[1]
+key_path = sys.argv[2]
+
+keys = {}
+with open(key_path, "r", encoding="utf-8") as handle:
+    for line in handle:
+        node, private_key, public_key = line.rstrip("\n").split("\t")
+        keys[node] = {
+            "private_key": private_key,
+            "public_key": public_key,
+        }
+
+section_re = re.compile(r'^\s*\[\s*node\s+"?([^"]+)"?\s*\]\s*$', re.IGNORECASE)
+key_re = re.compile(r'^\s*(private_key|public_key)\s*=', re.IGNORECASE)
+
+lines = []
+with open(config_path, "r", encoding="utf-8") as handle:
+    lines = handle.read().splitlines()
+
+output = []
+current_node = None
+seen_private = False
+seen_public = False
+
+def flush_missing():
+    if current_node and current_node in keys:
+        if not seen_private:
+            output.append(f"private_key = {keys[current_node]['private_key']}")
+        if not seen_public:
+            output.append(f"public_key = {keys[current_node]['public_key']}")
+
+for line in lines:
+    section_match = section_re.match(line)
+    if section_match:
+        flush_missing()
+        current_node = section_match.group(1)
+        seen_private = False
+        seen_public = False
+        output.append(line)
+        continue
+
+    if current_node and key_re.match(line):
+        key_name = key_re.match(line).group(1).lower()
+        if key_name == "private_key":
+            output.append(f"private_key = {keys[current_node]['private_key']}")
+            seen_private = True
+        elif key_name == "public_key":
+            output.append(f"public_key = {keys[current_node]['public_key']}")
+            seen_public = True
+        continue
+
+    output.append(line)
+
+flush_missing()
+
+tmp_path = config_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as handle:
+    handle.write("\n".join(output) + "\n")
+
+os.replace(tmp_path, config_path)
+PY
+
+  rm -f "$keyfile"
+  echo "Updated keys in $file"
+}
+
 install_failover() {
   local script_src="$ROOT_DIR/usr/local/bin/wg-failover"
   local service_src="$ROOT_DIR/wg-failover.service"
@@ -600,6 +702,9 @@ main() {
       ;;
     gen)
       gen_configs "$config" "$out_dir" "$gen_keys"
+      ;;
+    gen-keys)
+      generate_keys_for_inventory "$config" "$out_dir"
       ;;
     install-failover)
       install_failover
