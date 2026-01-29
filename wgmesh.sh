@@ -305,6 +305,34 @@ resolve_public_key() {
   echo ""
 }
 
+endpoint_ipv4() {
+  local endpoint="$1"
+  if [[ "$endpoint" =~ ^([0-9]{1,3}(\.[0-9]{1,3}){3}):[0-9]+$ ]]; then
+    echo "${BASH_REMATCH[1]}"
+  fi
+}
+
+peer_endpoint_ipv4s() {
+  local node="$1"
+  local -A seen=()
+  local peer
+  for peer in "${!NODE_NAMES[@]}"; do
+    if [[ "$peer" == "$node" ]]; then
+      continue
+    fi
+    local endpoint="${NODE_FIELDS[$peer.endpoint]:-}"
+    local endpoint_alt="${NODE_FIELDS[$peer.endpoint_alt]:-}"
+    local ip
+    for ep in "$endpoint" "$endpoint_alt"; do
+      ip="$(endpoint_ipv4 "$ep")"
+      if [[ -n "$ip" && -z "${seen[$ip]:-}" ]]; then
+        seen["$ip"]=1
+        echo "$ip"
+      fi
+    done
+  done
+}
+
 build_post_commands() {
   local node="$1"
   local phase="$2"
@@ -334,8 +362,16 @@ build_post_commands() {
       cmds+=("iptables -t nat -A POSTROUTING -o $nat_iface -j MASQUERADE")
     fi
     if node_uses_exit_routing "$node"; then
+      local listen_port="${MESH[port]:-51820}"
       cmds+=("ip rule add pref 100 fwmark 0x1 lookup 100 2>/dev/null || true")
       cmds+=("ip route replace default dev %i table 100")
+      cmds+=("iptables -t mangle -C OUTPUT -p udp --sport $listen_port -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --sport $listen_port -j RETURN")
+      local endpoint_ip
+      while IFS= read -r endpoint_ip; do
+        if [[ -n "$endpoint_ip" ]]; then
+          cmds+=("iptables -t mangle -C OUTPUT -d ${endpoint_ip}/32 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -d ${endpoint_ip}/32 -j RETURN")
+        fi
+      done < <(peer_endpoint_ipv4s "$node")
       local mesh_ip
       while IFS= read -r mesh_ip; do
         if [[ -n "$mesh_ip" ]]; then
@@ -370,7 +406,15 @@ build_post_commands() {
       cmds+=("iptables -t nat -D POSTROUTING -o $nat_iface -j MASQUERADE")
     fi
     if node_uses_exit_routing "$node"; then
+      local listen_port="${MESH[port]:-51820}"
       cmds+=("iptables -t mangle -D OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1 2>/dev/null || true")
+      cmds+=("iptables -t mangle -D OUTPUT -p udp --sport $listen_port -j RETURN 2>/dev/null || true")
+      local endpoint_ip
+      while IFS= read -r endpoint_ip; do
+        if [[ -n "$endpoint_ip" ]]; then
+          cmds+=("iptables -t mangle -D OUTPUT -d ${endpoint_ip}/32 -j RETURN 2>/dev/null || true")
+        fi
+      done < <(peer_endpoint_ipv4s "$node")
       local mesh_ip
       while IFS= read -r mesh_ip; do
         if [[ -n "$mesh_ip" ]]; then
