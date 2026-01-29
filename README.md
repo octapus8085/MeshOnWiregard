@@ -134,6 +134,78 @@ for macOS.
 If a node does **not** define `endpoint_alt`, no automatic failover is possible
 for that peer.
 
+## Policy-based routing for star (hub-and-spoke) topologies
+
+Yes—WireGuard supports a **star (hub-and-spoke) topology**. Each spoke peers with
+one or more hubs, and the hubs forward traffic between spokes or out to the
+internet. To make this work reliably, you typically:
+
+- Allow the hub(s) to advertise the destination networks via `allowed_ips`.
+- Enable IP forwarding (and NAT if the hub provides internet egress).
+- Use policy routing on spokes when only *some* traffic should traverse the hub.
+
+If you want spokes to forward **internet traffic** or a **closest/private network**
+through a preferred hub (e.g., try `charlie`, fall back to `bravo`), combine
+WireGuard allowed IPs with Linux policy routing:
+
+1. **Advertise hub egress in the inventory** so spokes can route to it.
+   For example, in `mesh.conf`, give the hub peers `allowed_ips` that include
+   internet/default routes and/or private networks you want to reach:
+   ```ini
+   [node "charlie"]
+   allowed_ips = 0.0.0.0/0, ::/0, 10.10.0.0/16
+
+   [node "bravo"]
+   allowed_ips = 0.0.0.0/0, ::/0, 10.10.0.0/16
+   ```
+2. **Add policy routing rules** on each spoke so only select sources use the hub.
+   Example: route a LAN behind the spoke (`192.168.50.0/24`) through the hub while
+   keeping the host’s own traffic local:
+   ```bash
+   # Use table 100 for hub egress.
+   sudo ip rule add from 192.168.50.0/24 table 100
+   # Prefer charlie as default in table 100.
+   sudo ip route replace default via 10.0.0.3 dev wg0 table 100
+   ```
+3. **Add a simple failover hook** to prefer `charlie` but fall back to `bravo`.
+   A lightweight timer or cron job can update the route based on reachability:
+   ```bash
+   # If charlie is reachable, keep it as the egress.
+   if ping -c1 -W1 10.0.0.3 >/dev/null 2>&1; then
+     sudo ip route replace default via 10.0.0.3 dev wg0 table 100
+   else
+     sudo ip route replace default via 10.0.0.2 dev wg0 table 100
+   fi
+   ```
+
+4. **Use PostUp/PostDown hooks for hubs (iptables + forwarding).** `wgmesh.sh`
+   can generate these automatically per node when you set `forwarding` and
+   `nat_iface` in `mesh.conf`:
+   ```ini
+   [node "charlie"]
+   # Hub node: enable forwarding and NAT out eth0.
+   forwarding = true
+   nat_iface = eth0
+
+   [node "alpha"]
+   # Spoke node: optional routing policy for a LAN behind the spoke.
+   post_up = ip rule add from 192.168.50.0/24 table 100; ip route replace default via 10.40.0.3 dev %i table 100
+   post_down = ip rule del from 192.168.50.0/24 table 100; ip route del default via 10.40.0.3 dev %i table 100
+   ```
+   This emits valid `PostUp`/`PostDown` lines in each generated config. Hub
+   nodes get `sysctl -w net.ipv4.ip_forward=1` plus iptables forward/NAT rules,
+   and any `post_up`/`post_down` you set are appended after those defaults.
+
+This keeps your mesh fully connected while steering only selected traffic through
+the “closest” hub and failing over automatically if the preferred hub drops.
+
+**Hub prerequisites:** ensure forwarding is enabled and NAT is configured when
+acting as an internet gateway. Example (Linux):
+```bash
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+```
+
 ## Tailscale / endpoint guidance
 
 - If you want WireGuard to ride on **public IPs**, set `endpoint` to the public
