@@ -454,7 +454,17 @@ generate_keys_for_inventory() {
     printf '%s\t%s\t%s\n' "$node" "$private_key" "$public_key" >> "$keyfile"
   done
 
-  python - "$file" "$keyfile" <<'PY'
+  local python_bin="python"
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    python_bin="python3"
+  fi
+  if ! command -v "$python_bin" >/dev/null 2>&1; then
+    echo "python (or python3) is required to update the config but was not found in PATH." >&2
+    rm -f "$keyfile"
+    exit 1
+  fi
+
+  "$python_bin" - "$file" "$keyfile" <<'PY'
 import os
 import re
 import sys
