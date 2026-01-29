@@ -1,0 +1,10 @@
+[Unit]
+Description=Run WireGuard exit selector checks
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=20s
+Unit=wg-exit-selector.service
+
+[Install]
+WantedBy=timers.target

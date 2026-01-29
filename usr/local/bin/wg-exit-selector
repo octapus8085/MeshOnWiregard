@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/wireguard/wg-exit-selector.conf"
+OVERRIDE_FILE="/etc/wireguard/exit.override"
+LOG_PREFIX="wg-exit-selector"
+
+log() {
+  echo "${LOG_PREFIX}: $*"
+}
+
+trim() {
+  local s="$1"
+  s="${s#${s%%[![:space:]]*}}"
+  s="${s%${s##*[![:space:]]}}"
+  printf '%s' "$s"
+}
+
+require_config() {
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    log "Missing config: $CONFIG_FILE"
+    exit 1
+  fi
+  # shellcheck source=/etc/wireguard/wg-exit-selector.conf
+  source "$CONFIG_FILE"
+  if [[ -z "${INTERFACE:-}" ]]; then
+    log "INTERFACE not set in $CONFIG_FILE"
+    exit 1
+  fi
+  if [[ ${#EXIT_NODES[@]} -eq 0 ]]; then
+    log "No EXIT_NODES defined in $CONFIG_FILE"
+    exit 0
+  fi
+}
+
+handshake_ages() {
+  local iface="$1"
+  declare -gA HANDSHAKES=()
+  while read -r key ts; do
+    HANDSHAKES["$key"]="$ts"
+  done < <(wg show "$iface" latest-handshakes 2>/dev/null)
+}
+
+handshake_age_seconds() {
+  local pubkey="$1"
+  local now
+  now="$(date +%s)"
+  local ts="${HANDSHAKES[$pubkey]:-0}"
+  if [[ -z "$ts" || "$ts" -eq 0 ]]; then
+    echo "-1"
+    return
+  fi
+  echo $((now - ts))
+}
+
+ping_latency_ms() {
+  local iface="$1"
+  local target="$2"
+  local output
+  output=$(ping -c1 -W1 -I "$iface" "$target" 2>/dev/null | awk -F'time=' '/time=/{print $2}' | awk '{print $1}' | head -n1 || true)
+  if [[ -z "$output" ]]; then
+    echo ""
+    return 1
+  fi
+  awk -v val="$output" 'BEGIN{printf "%.0f", val}'
+}
+
+select_exit() {
+  local policy="${EXIT_POLICY:-latency}"
+  local primary="${EXIT_PRIMARY:-}"
+  local interval="${EXIT_CHECK_INTERVAL_SECONDS:-20}"
+  local threshold=$((interval * 3))
+  if [[ "$threshold" -le 0 ]]; then
+    threshold=60
+  fi
+
+  if [[ -f "$OVERRIDE_FILE" ]]; then
+    local override
+    override="$(trim "$(cat "$OVERRIDE_FILE" 2>/dev/null)")"
+    if [[ -n "$override" ]]; then
+      local entry
+      for entry in "${EXIT_NODES[@]}"; do
+        IFS='|' read -r name _ _ <<< "$entry"
+        if [[ "$name" == "$override" ]]; then
+          echo "$name"
+          return 0
+        fi
+      done
+      log "Override requested '$override' but it is not in EXIT_NODES"
+    fi
+  fi
+
+  if [[ "$policy" == "manual" ]]; then
+    if [[ -n "$primary" ]]; then
+      echo "$primary"
+      return 0
+    fi
+    IFS='|' read -r first_name _ _ <<< "${EXIT_NODES[0]}"
+    echo "$first_name"
+    return 0
+  fi
+
+  local best_name=""
+  local best_score=""
+  local entry
+  for entry in "${EXIT_NODES[@]}"; do
+    IFS='|' read -r name pubkey ip <<< "$entry"
+    local latency=""
+    latency="$(ping_latency_ms "$INTERFACE" "$ip" || true)"
+    local score=""
+    if [[ -n "$latency" ]]; then
+      score="$latency"
+    else
+      local age
+      age="$(handshake_age_seconds "$pubkey")"
+      if [[ "$age" -ge 0 && "$age" -le "$threshold" ]]; then
+        score=$((age * 1000 + 100000))
+      else
+        continue
+      fi
+    fi
+    if [[ -z "$best_score" || "$score" -lt "$best_score" ]]; then
+      best_score="$score"
+      best_name="$name"
+    fi
+  done
+
+  if [[ -n "$best_name" ]]; then
+    echo "$best_name"
+    return 0
+  fi
+
+  if [[ -n "$primary" ]]; then
+    echo "$primary"
+    return 0
+  fi
+
+  IFS='|' read -r first_name _ _ <<< "${EXIT_NODES[0]}"
+  echo "$first_name"
+}
+
+apply_exit() {
+  local chosen="$1"
+  local entry
+  for entry in "${EXIT_NODES[@]}"; do
+    IFS='|' read -r name pubkey ip <<< "$entry"
+    if [[ -z "$pubkey" || -z "$ip" ]]; then
+      log "Skipping $name due to missing pubkey or ip"
+      continue
+    fi
+    local desired="${ip}/32"
+    if [[ "$name" == "$chosen" ]]; then
+      desired="${ip}/32,0.0.0.0/0"
+    fi
+    local current
+    current=$(wg show "$INTERFACE" allowed-ips 2>/dev/null | awk -v key="$pubkey" '$1 == key {print $2}')
+    if [[ -z "$current" ]]; then
+      log "Missing current allowed-ips for $name"
+      continue
+    fi
+    if [[ "$current" == "$desired" ]]; then
+      continue
+    fi
+    if [[ "$name" == "$chosen" && "$current" == *"0.0.0.0/0"* ]]; then
+      if [[ "$current" == *"${ip}/32"* ]]; then
+        continue
+      fi
+    fi
+    wg set "$INTERFACE" peer "$pubkey" allowed-ips "$desired"
+    if [[ "$name" == "$chosen" ]]; then
+      log "Selected exit $name"
+    else
+      log "Removed default route from $name"
+    fi
+  done
+}
+
+status() {
+  handshake_ages "$INTERFACE"
+  local active_pubkey=""
+  local line
+  while read -r key allowed; do
+    if [[ "$allowed" == *"0.0.0.0/0"* ]]; then
+      active_pubkey="$key"
+      break
+    fi
+  done < <(wg show "$INTERFACE" allowed-ips 2>/dev/null)
+
+  local active_name=""
+  local entry
+  for entry in "${EXIT_NODES[@]}"; do
+    IFS='|' read -r name pubkey ip <<< "$entry"
+    if [[ "$pubkey" == "$active_pubkey" ]]; then
+      active_name="$name"
+      break
+    fi
+  done
+
+  echo "Interface: $INTERFACE"
+  if [[ -n "$active_name" ]]; then
+    echo "Active exit: $active_name"
+  else
+    echo "Active exit: none"
+  fi
+  echo "Exit metrics:"
+  for entry in "${EXIT_NODES[@]}"; do
+    IFS='|' read -r name pubkey ip <<< "$entry"
+    local latency=""
+    latency="$(ping_latency_ms "$INTERFACE" "$ip" || true)"
+    local age
+    age="$(handshake_age_seconds "$pubkey")"
+    if [[ -z "$latency" ]]; then
+      latency="unreachable"
+    else
+      latency="${latency}ms"
+    fi
+    if [[ "$age" -lt 0 ]]; then
+      age="never"
+    else
+      age="${age}s"
+    fi
+    echo "- ${name}: ping=${latency} handshake_age=${age}"
+  done
+  if [[ -n "${EXIT_TEST_TARGET:-}" ]]; then
+    local target_latency
+    target_latency="$(ping_latency_ms "$INTERFACE" "$EXIT_TEST_TARGET" || true)"
+    if [[ -z "$target_latency" ]]; then
+      target_latency="unreachable"
+    else
+      target_latency="${target_latency}ms"
+    fi
+    echo "Test target (${EXIT_TEST_TARGET}): ${target_latency}"
+  fi
+}
+
+main() {
+  require_config
+
+  if [[ "${1:-}" == "status" || "${1:-}" == "--status" ]]; then
+    status
+    return
+  fi
+
+  if ! command -v wg >/dev/null 2>&1; then
+    log "wg not found in PATH"
+    exit 1
+  fi
+
+  handshake_ages "$INTERFACE"
+  local selected
+  selected="$(select_exit)"
+  if [[ -z "$selected" ]]; then
+    log "No exit selected"
+    exit 1
+  fi
+  apply_exit "$selected"
+}
+
+main "$@"
