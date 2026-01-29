@@ -23,7 +23,7 @@ Options (common):
   --gen-keys               Generate missing keypairs locally (requires wg).
 
 Options (apply):
-  -n, --node <name>        Node name to install on this host (required).
+  -n, --node <name>        Node name to install on this host (or set local_node in [mesh]).
   --interface <ifname>     Override interface name (default from mesh.conf).
   --dry-run                Print target paths without writing.
 
@@ -53,7 +53,7 @@ trim() {
 
 is_placeholder() {
   local value="$1"
-  [[ -n "$value" && "$value" =~ ^<.*>$ ]]
+  [[ -n "$value" && "$value" =~ ^\<.*\>$ ]]
 }
 
 parse_mesh_conf() {
@@ -597,8 +597,12 @@ apply_config() {
   local gen_keys="$6"
 
   if [[ -z "$node" ]]; then
-    echo "--node is required for apply" >&2
-    exit 1
+    load_config "$file"
+    node="${MESH[local_node]:-}"
+    if [[ -z "$node" ]]; then
+      echo "--node is required for apply (or set local_node in [mesh])." >&2
+      exit 1
+    fi
   fi
 
   gen_configs "$file" "$out_dir" "$gen_keys"

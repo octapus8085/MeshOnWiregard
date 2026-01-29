@@ -34,6 +34,7 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ```bash
    sudo ./wgmesh.sh apply -c mesh.local.conf -o ./out --node alpha
    ```
+   Or set `local_node` in `[mesh]` and omit `--node`.
 5. **Install configs remotely over SSH**
    ```bash
    ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all
@@ -96,6 +97,8 @@ for macOS.
 ## Inventory requirements
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
+- `[mesh]` can include `local_node` to indicate which `[node]` entry refers to
+  the current host (used as a default for `apply` when `--node` is omitted).
 - Each `[node "name"]` entry must include:
   - `address` (CIDR), `endpoint`, and `allowed_ips`.
   - `public_key` is required unless you run with `--gen-keys` and provide a writable `private_key_path` (or allow keys to be generated under `out/keys`).
