@@ -38,6 +38,10 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ```bash
    ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all
    ```
+   If your remote `sudo` requires a TTY (common with `requiretty`), add:
+   ```bash
+   ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all --ssh-tty
+   ```
    You can combine with `--gen-keys` to generate missing keypairs locally before pushing.
    If you need to generate keys and persist them back into the inventory:
    ```bash

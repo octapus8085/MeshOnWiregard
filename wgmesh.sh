@@ -31,6 +31,7 @@ Options (apply-remote):
   -n, --node <name>        Node name to install on remote host.
   --all                    Apply to all nodes in inventory.
   --interface <ifname>     Override interface name (default from mesh.conf).
+  --ssh-tty                Allocate a TTY for SSH (useful for sudo prompts).
   --dry-run                Print target paths without writing.
 
 Examples:
@@ -607,6 +608,7 @@ apply_remote() {
   local dry_run="$5"
   local all_nodes="$6"
   local gen_keys="$7"
+  local ssh_tty="$8"
 
   if [[ "$all_nodes" != "true" && -z "$node" ]]; then
     echo "--node or --all is required for apply-remote" >&2
@@ -643,6 +645,9 @@ apply_remote() {
     if [[ -n "$ssh_port" ]]; then
       ssh_cmd+=(-p "$ssh_port")
       scp_cmd+=(-P "$ssh_port")
+    fi
+    if [[ "$ssh_tty" == "true" ]]; then
+      ssh_cmd+=(-t)
     fi
 
     local remote_dir="/tmp/wgmesh-${node_name}"
@@ -694,6 +699,7 @@ main() {
   local dry_run="false"
   local all_nodes="false"
   local gen_keys="false"
+  local ssh_tty="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -719,6 +725,10 @@ main() {
         ;;
       --all)
         all_nodes="true"
+        shift
+        ;;
+      --ssh-tty)
+        ssh_tty="true"
         shift
         ;;
       --gen-keys)
@@ -754,7 +764,7 @@ main() {
       apply_config "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$gen_keys"
       ;;
     apply-remote)
-      apply_remote "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$all_nodes" "$gen_keys"
+      apply_remote "$config" "$node" "$out_dir" "$override_iface" "$dry_run" "$all_nodes" "$gen_keys" "$ssh_tty"
       ;;
     *)
       echo "Unknown command: $cmd" >&2
