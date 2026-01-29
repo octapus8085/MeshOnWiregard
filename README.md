@@ -39,6 +39,10 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
    ./wgmesh.sh apply-remote -c mesh.local.conf -o ./out --all
    ```
    You can combine with `--gen-keys` to generate missing keypairs locally before pushing.
+   If you need to generate keys and persist them back into the inventory:
+   ```bash
+   ./wgmesh.sh gen-keys -c mesh.local.conf -o ./out
+   ```
 6. **Install the failover helper and systemd units**
    ```bash
    sudo ./wgmesh.sh install-failover
@@ -98,6 +102,7 @@ for macOS.
 - `endpoint_alt` is optional but recommended for failover.
 - `private_key` or `private_key_path` can be provided to embed the key when generating configs.
   - With `--gen-keys`, missing keys are generated with `wg genkey` and public keys are derived with `wg pubkey`.
+  - With `gen-keys`, missing keys are generated and written back into the inventory file.
 - `allowed_ips` may be a comma-delimited list of CIDRs.
 
 ## Validation behavior
