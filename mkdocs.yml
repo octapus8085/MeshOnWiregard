@@ -1,0 +1,12 @@
+site_name: MeshOnWiregard Docs
+nav:
+  - Overview: docs/00-overview.md
+  - Inventory Spec: docs/01-inventory-spec.md
+  - Topologies: docs/02-topologies.md
+  - Routing & Fwmarks: docs/03-routing-fwmark.md
+  - Exit Routing: docs/04-exit-routing.md
+  - Troubleshooting: docs/05-troubleshooting.md
+  - Migration Guide: docs/06-migration-guide.md
+  - Security: docs/07-security.md
+  - Roadmap: docs/08-roadmap-dynamic-routing.md
+  - Tasks: docs/09-tasks.md
