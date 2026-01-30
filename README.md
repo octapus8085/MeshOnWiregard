@@ -1,6 +1,6 @@
 # MeshOnWiregard
 
-This repo provides a minimal inventory-driven workflow for generating WireGuard mesh configs and a failover helper to swap peer endpoints when the primary host is unreachable.
+This repo provides a minimal inventory-driven workflow for generating WireGuard mesh configs and a failover helper to swap peer endpoints when the primary host is unreachable. It now includes a docs set covering topologies, routing marks, and operational guidance in `docs/`.
 
 ## Files
 
@@ -13,6 +13,23 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 - `usr/local/bin/wg-exit-selector`: Exit selector helper for smart egress routing.
 - `wg-exit-selector.service`: systemd unit for the exit selector.
 - `wg-exit-selector.timer`: systemd timer for periodic exit selection.
+- `docs/`: Operational documentation and migration guides.
+- `mkdocs.yml`: Optional MkDocs config for GitHub Pages.
+
+## Documentation
+
+Start here:
+
+- [Overview](docs/00-overview.md)
+- [Inventory spec](docs/01-inventory-spec.md)
+- [Topologies (full mesh vs star)](docs/02-topologies.md)
+- [Routing & fwmark policy](docs/03-routing-fwmark.md)
+- [Exit routing](docs/04-exit-routing.md)
+- [Troubleshooting](docs/05-troubleshooting.md)
+- [Migration guide](docs/06-migration-guide.md)
+- [Security](docs/07-security.md)
+- [Dynamic routing roadmap](docs/08-roadmap-dynamic-routing.md)
+- [Tasks & acceptance criteria](docs/09-tasks.md)
 
 ## Usage steps (exact)
 
@@ -106,6 +123,8 @@ for macOS.
 ## Inventory requirements
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
+- `[mesh]` must include `mesh_cidr` (RFC1918 or ULA), for example `10.40.0.0/24`.
+- `[mesh]` may include `topology = star` with `hubs = alpha,charlie` to enable hub/spoke behavior.
 - `[mesh]` can include `local_node` to indicate which `[node]` entry refers to
   the current host (used as a default for `apply` when `--node` is omitted).
 - Each `[node "name"]` entry must include:
@@ -187,11 +206,11 @@ enable_nat = true
   configured `exit_out_iface`.
 - **Exit-enabled nodes** get:
   - `Table = off` to prevent wg-quick from managing routes.
-  - Policy routing in table `100`:
-    - mark non-mesh traffic with `fwmark 0x1`,
-    - `ip rule` sends the marked traffic to table `100`,
-    - `ip route` adds a default route via `wg0` in table `100`,
-    - mesh `/32` routes are added explicitly to keep mesh traffic local.
+  - Policy routing in table `101`:
+    - mark non-mesh traffic with `fwmark 0x101`,
+    - `ip rule` sends the marked traffic to table `101`,
+    - `ip route` adds a default route via `wg0` in table `101`,
+    - mesh CIDR and RFC1918 destinations are excluded from marking.
 - The **wg-exit-selector** service:
   - measures reachability using WireGuard handshakes and ping to exit WG IPs,
   - selects the lowest-latency reachable exit (or `exit_primary` in manual mode),
