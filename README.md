@@ -7,12 +7,26 @@ This repo provides a minimal inventory-driven workflow for generating WireGuard 
 - `wgmesh.sh`: Inventory-aware helper script with `validate`, `gen`, `install-failover`, and `apply` subcommands.
 - `wgmesh.sh`: Also includes `apply-remote` to install configs over SSH using your local SSH config.
 - `mesh.conf`: Example inventory format.
+- `docs/`: Markdown docs for topology, routing, and operational guidance.
 - `usr/local/bin/wg-failover`: Template failover helper script.
 - `wg-failover.service`: systemd unit for the failover check.
 - `wg-failover.timer`: systemd timer for periodic failover checks.
 - `usr/local/bin/wg-exit-selector`: Exit selector helper for smart egress routing.
 - `wg-exit-selector.service`: systemd unit for the exit selector.
 - `wg-exit-selector.timer`: systemd timer for periodic exit selection.
+
+## Documentation (start here)
+
+- [Overview](docs/00-overview.md)
+- [Inventory spec](docs/01-inventory-spec.md)
+- [Topologies](docs/02-topologies.md)
+- [Routing & fwmark plan](docs/03-routing-fwmark.md)
+- [Exit routing](docs/04-exit-routing.md)
+- [Troubleshooting](docs/05-troubleshooting.md)
+- [Migration guide](docs/06-migration-guide.md)
+- [Security](docs/07-security.md)
+- [Roadmap](docs/08-roadmap-dynamic-routing.md)
+- [Tasks & acceptance criteria](docs/09-tasks.md)
 
 ## Usage steps (exact)
 
@@ -106,8 +120,13 @@ for macOS.
 ## Inventory requirements
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
+- `[mesh]` must include `mesh_cidr` (RFC1918, e.g., `10.40.0.0/24`) to drive routing exclusions.
 - `[mesh]` can include `local_node` to indicate which `[node]` entry refers to
   the current host (used as a default for `apply` when `--node` is omitted).
+- Optional topology fields:
+  - `topology` (`fullmesh` or `star`, defaults to `fullmesh`),
+  - `hubs` (comma-delimited hub node names; required for `topology=star`),
+  - `hub_selection` (`static` or `latency`, optional).
 - Each `[node "name"]` entry must include:
   - `address` (CIDR), `endpoint`, and `allowed_ips`.
   - `public_key` is required unless you run with `--gen-keys` and provide a writable `private_key_path` (or allow keys to be generated under `out/keys`).
@@ -153,7 +172,7 @@ for macOS.
 If a node does **not** define `endpoint_alt`, no automatic failover is possible
 for that peer.
 
-## Smart exit routing (full mesh)
+## Smart exit routing
 
 This repo can keep full-mesh connectivity intact while forwarding **internet
 traffic** through the cheapest/closest exit node. Mesh peer `AllowedIPs` remain
@@ -187,11 +206,12 @@ enable_nat = true
   configured `exit_out_iface`.
 - **Exit-enabled nodes** get:
   - `Table = off` to prevent wg-quick from managing routes.
-  - Policy routing in table `100`:
-    - mark non-mesh traffic with `fwmark 0x1`,
-    - `ip rule` sends the marked traffic to table `100`,
-    - `ip route` adds a default route via `wg0` in table `100`,
-    - mesh `/32` routes are added explicitly to keep mesh traffic local.
+  - Policy routing in table `101`:
+    - mark non-mesh traffic with `fwmark 0x101`,
+    - `ip rule` sends the marked traffic to table `101`,
+    - `ip route` adds a default route via `wg0` in table `101`,
+    - exclusions are applied for `mesh_cidr`, RFC1918 LANs, `127.0.0.0/8`,
+      `100.64.0.0/10`, and `tailscale0` output.
 - The **wg-exit-selector** service:
   - measures reachability using WireGuard handshakes and ping to exit WG IPs,
   - selects the lowest-latency reachable exit (or `exit_primary` in manual mode),
