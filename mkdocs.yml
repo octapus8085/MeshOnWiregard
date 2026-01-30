@@ -1,0 +1,15 @@
+site_name: MeshOnWiregard Docs
+site_url: https://octapus8085.github.io/MeshOnWiregard/
+repo_url: https://github.com/octapus8085/MeshOnWiregard
+docs_dir: docs
+nav:
+  - Overview: 00-overview.md
+  - Inventory Spec: 01-inventory-spec.md
+  - Topologies: 02-topologies.md
+  - Routing + fwmark: 03-routing-fwmark.md
+  - Exit Routing: 04-exit-routing.md
+  - Troubleshooting: 05-troubleshooting.md
+  - Migration Guide: 06-migration-guide.md
+  - Security: 07-security.md
+  - Dynamic Routing Roadmap: 08-roadmap-dynamic-routing.md
+  - Tasks: 09-tasks.md

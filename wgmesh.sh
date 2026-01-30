@@ -4,6 +4,11 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_CONFIG="${ROOT_DIR}/mesh.conf"
 DEFAULT_OUT_DIR="${ROOT_DIR}/out"
+MARK_EXIT=0x101
+TABLE_EXIT=101
+MARK_MESH_BYPASS=0x102
+TAILSCALE_MARK=0x80000
+TAILSCALE_MASK=0xff0000
 
 usage() {
   cat <<'USAGE'
@@ -109,6 +114,113 @@ strip_cidr() {
   echo "${value%%/*}"
 }
 
+ipv4_to_int() {
+  local ip="$1"
+  IFS='.' read -r o1 o2 o3 o4 <<< "$ip"
+  if [[ -z "$o1" || -z "$o2" || -z "$o3" || -z "$o4" ]]; then
+    echo ""
+    return 1
+  fi
+  if [[ ! "$o1" =~ ^[0-9]+$ || ! "$o2" =~ ^[0-9]+$ || ! "$o3" =~ ^[0-9]+$ || ! "$o4" =~ ^[0-9]+$ ]]; then
+    echo ""
+    return 1
+  fi
+  if [[ "$o1" -gt 255 || "$o2" -gt 255 || "$o3" -gt 255 || "$o4" -gt 255 ]]; then
+    echo ""
+    return 1
+  fi
+  echo $(( (o1 << 24) + (o2 << 16) + (o3 << 8) + o4 ))
+}
+
+is_rfc1918_ipv4() {
+  local ip="$1"
+  local ip_int
+  ip_int="$(ipv4_to_int "$ip")" || return 1
+  local ten_start ten_end
+  local one72_start one72_end
+  local one92_start one92_end
+  ten_start="$(ipv4_to_int "10.0.0.0")"
+  ten_end="$(ipv4_to_int "10.255.255.255")"
+  one72_start="$(ipv4_to_int "172.16.0.0")"
+  one72_end="$(ipv4_to_int "172.31.255.255")"
+  one92_start="$(ipv4_to_int "192.168.0.0")"
+  one92_end="$(ipv4_to_int "192.168.255.255")"
+  if (( ip_int >= ten_start && ip_int <= ten_end )); then
+    return 0
+  fi
+  if (( ip_int >= one72_start && ip_int <= one72_end )); then
+    return 0
+  fi
+  if (( ip_int >= one92_start && ip_int <= one92_end )); then
+    return 0
+  fi
+  return 1
+}
+
+is_ula_ipv6() {
+  local ip="$1"
+  local lowered="${ip,,}"
+  if [[ "$lowered" =~ ^f[cd] ]]; then
+    return 0
+  fi
+  return 1
+}
+
+ipv4_in_cidr() {
+  local ip="$1"
+  local cidr="$2"
+  local base="${cidr%%/*}"
+  local prefix="${cidr##*/}"
+  if [[ -z "$prefix" || "$prefix" -lt 0 || "$prefix" -gt 32 ]]; then
+    return 1
+  fi
+  local ip_int
+  local base_int
+  ip_int="$(ipv4_to_int "$ip")" || return 1
+  base_int="$(ipv4_to_int "$base")" || return 1
+  local mask
+  if (( prefix == 0 )); then
+    mask=0
+  else
+    mask=$(( 0xffffffff << (32 - prefix) & 0xffffffff ))
+  fi
+  if (( (ip_int & mask) == (base_int & mask) )); then
+    return 0
+  fi
+  return 1
+}
+
+mesh_topology() {
+  local topology="${MESH[topology]:-fullmesh}"
+  topology="$(trim "$topology")"
+  topology="${topology,,}"
+  if [[ -z "$topology" ]]; then
+    topology="fullmesh"
+  fi
+  echo "$topology"
+}
+
+mesh_hubs() {
+  local hubs="${MESH[hubs]:-}"
+  local items=()
+  split_csv "$hubs" items
+  printf '%s\n' "${items[@]}"
+}
+
+node_is_hub() {
+  local node="$1"
+  if [[ "$(mesh_topology)" != "star" ]]; then
+    return 1
+  fi
+  local hub
+  while IFS= read -r hub; do
+    if [[ "$hub" == "$node" ]]; then
+      return 0
+    fi
+  done < <(mesh_hubs)
+  return 1
+}
+
 node_is_exit() {
   local node="$1"
   local exit_nodes="${MESH[exit_nodes]:-}"
@@ -134,22 +246,6 @@ node_uses_exit_routing() {
   fi
   shopt -u nocasematch
   list_contains_csv "$enabled" "$node"
-}
-
-mesh_ipv4_addresses() {
-  local addresses=()
-  local node_name
-  for node_name in "${!NODE_NAMES[@]}"; do
-    local address="${NODE_FIELDS[$node_name.address]:-}"
-    if [[ -z "$address" ]]; then
-      continue
-    fi
-    if [[ "$address" == *":"* ]]; then
-      continue
-    fi
-    addresses+=("$(strip_cidr "$address")")
-  done
-  printf '%s\n' "${addresses[@]}"
 }
 
 parse_mesh_conf() {
@@ -314,40 +410,47 @@ build_post_commands() {
   local enable_nat="${NODE_FIELDS[$node.enable_nat]:-}"
   local extra_up="${NODE_FIELDS[$node.post_up]:-}"
   local extra_down="${NODE_FIELDS[$node.post_down]:-}"
+  local mesh_cidr="${MESH[mesh_cidr]:-}"
   local cmds=()
 
   if [[ "$phase" == "up" ]]; then
     if node_is_exit "$node" && is_truthy "$enable_nat"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=1")
       if [[ -n "$exit_out_iface" ]]; then
-        cmds+=("iptables -A FORWARD -i %i -o $exit_out_iface -j ACCEPT")
-        cmds+=("iptables -A FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
-        cmds+=("iptables -t nat -A POSTROUTING -o $exit_out_iface -j MASQUERADE")
+        cmds+=("iptables -C FORWARD -i %i -o $exit_out_iface -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -o $exit_out_iface -j ACCEPT")
+        cmds+=("iptables -C FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+        cmds+=("iptables -t nat -C POSTROUTING -o $exit_out_iface -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $exit_out_iface -j MASQUERADE")
       fi
     fi
     if is_truthy "$forwarding"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=1")
     fi
     if [[ -n "$nat_iface" ]]; then
-      cmds+=("iptables -A FORWARD -i %i -o $nat_iface -j ACCEPT")
-      cmds+=("iptables -A FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
-      cmds+=("iptables -t nat -A POSTROUTING -o $nat_iface -j MASQUERADE")
+      cmds+=("iptables -C FORWARD -i %i -o $nat_iface -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -o $nat_iface -j ACCEPT")
+      cmds+=("iptables -C FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
+      cmds+=("iptables -t nat -C POSTROUTING -o $nat_iface -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o $nat_iface -j MASQUERADE")
+    fi
+    if node_is_hub "$node"; then
+      cmds+=("sysctl -w net.ipv4.ip_forward=1")
+      cmds+=("iptables -C FORWARD -i %i -o %i -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %i -o %i -j ACCEPT")
     fi
     if node_uses_exit_routing "$node"; then
-      cmds+=("ip rule add pref 100 fwmark 0x1 lookup 100 2>/dev/null || true")
-      cmds+=("ip route replace default dev %i table 100")
-      local mesh_ip
-      while IFS= read -r mesh_ip; do
-        if [[ -n "$mesh_ip" ]]; then
-          cmds+=("ip route add ${mesh_ip}/32 dev %i 2>/dev/null || true")
-        fi
-      done < <(mesh_ipv4_addresses)
-      while IFS= read -r mesh_ip; do
-        if [[ -n "$mesh_ip" ]]; then
-          cmds+=("iptables -t mangle -C OUTPUT -d ${mesh_ip}/32 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -d ${mesh_ip}/32 -j RETURN")
-        fi
-      done < <(mesh_ipv4_addresses)
-      cmds+=("iptables -t mangle -C OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1")
+      cmds+=("ip rule add pref 100 fwmark ${MARK_EXIT} lookup ${TABLE_EXIT} 2>/dev/null || true")
+      cmds+=("ip route replace default dev %i table ${TABLE_EXIT}")
+      if [[ -n "$mesh_cidr" ]]; then
+        cmds+=("ip route replace ${mesh_cidr} dev %i table ${TABLE_EXIT}")
+      fi
+      local exclude_cidrs=()
+      if [[ -n "$mesh_cidr" ]]; then
+        exclude_cidrs+=("$mesh_cidr")
+      fi
+      exclude_cidrs+=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10")
+      local exclude
+      for exclude in "${exclude_cidrs[@]}"; do
+        cmds+=("iptables -t mangle -C OUTPUT -d ${exclude} -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -d ${exclude} -j RETURN")
+      done
+      cmds+=("if ip link show tailscale0 >/dev/null 2>&1; then iptables -t mangle -C OUTPUT -o tailscale0 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -o tailscale0 -j RETURN; fi")
+      cmds+=("iptables -t mangle -C OUTPUT -m mark --mark 0x0 -j MARK --set-mark ${MARK_EXIT} 2>/dev/null || iptables -t mangle -A OUTPUT -m mark --mark 0x0 -j MARK --set-mark ${MARK_EXIT}")
     fi
     if [[ -n "$extra_up" ]]; then
       cmds+=("$extra_up")
@@ -356,34 +459,40 @@ build_post_commands() {
     if node_is_exit "$node" && is_truthy "$enable_nat"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=0")
       if [[ -n "$exit_out_iface" ]]; then
-        cmds+=("iptables -D FORWARD -i %i -o $exit_out_iface -j ACCEPT")
-        cmds+=("iptables -D FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
-        cmds+=("iptables -t nat -D POSTROUTING -o $exit_out_iface -j MASQUERADE")
+        cmds+=("iptables -D FORWARD -i %i -o $exit_out_iface -j ACCEPT 2>/dev/null || true")
+        cmds+=("iptables -D FORWARD -i $exit_out_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true")
+        cmds+=("iptables -t nat -D POSTROUTING -o $exit_out_iface -j MASQUERADE 2>/dev/null || true")
       fi
     fi
     if is_truthy "$forwarding"; then
       cmds+=("sysctl -w net.ipv4.ip_forward=0")
     fi
     if [[ -n "$nat_iface" ]]; then
-      cmds+=("iptables -D FORWARD -i %i -o $nat_iface -j ACCEPT")
-      cmds+=("iptables -D FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT")
-      cmds+=("iptables -t nat -D POSTROUTING -o $nat_iface -j MASQUERADE")
+      cmds+=("iptables -D FORWARD -i %i -o $nat_iface -j ACCEPT 2>/dev/null || true")
+      cmds+=("iptables -D FORWARD -i $nat_iface -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true")
+      cmds+=("iptables -t nat -D POSTROUTING -o $nat_iface -j MASQUERADE 2>/dev/null || true")
+    fi
+    if node_is_hub "$node"; then
+      cmds+=("iptables -D FORWARD -i %i -o %i -j ACCEPT 2>/dev/null || true")
+      cmds+=("sysctl -w net.ipv4.ip_forward=0")
     fi
     if node_uses_exit_routing "$node"; then
-      cmds+=("iptables -t mangle -D OUTPUT -m mark --mark 0x0 -j MARK --set-mark 0x1 2>/dev/null || true")
-      local mesh_ip
-      while IFS= read -r mesh_ip; do
-        if [[ -n "$mesh_ip" ]]; then
-          cmds+=("iptables -t mangle -D OUTPUT -d ${mesh_ip}/32 -j RETURN 2>/dev/null || true")
-        fi
-      done < <(mesh_ipv4_addresses)
-      while IFS= read -r mesh_ip; do
-        if [[ -n "$mesh_ip" ]]; then
-          cmds+=("ip route del ${mesh_ip}/32 dev %i 2>/dev/null || true")
-        fi
-      done < <(mesh_ipv4_addresses)
-      cmds+=("ip route del default dev %i table 100 2>/dev/null || true")
-      cmds+=("ip rule del pref 100 fwmark 0x1 lookup 100 2>/dev/null || true")
+      cmds+=("iptables -t mangle -D OUTPUT -m mark --mark 0x0 -j MARK --set-mark ${MARK_EXIT} 2>/dev/null || true")
+      local exclude_cidrs=()
+      if [[ -n "$mesh_cidr" ]]; then
+        exclude_cidrs+=("$mesh_cidr")
+      fi
+      exclude_cidrs+=("127.0.0.0/8" "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "100.64.0.0/10")
+      local exclude
+      for exclude in "${exclude_cidrs[@]}"; do
+        cmds+=("iptables -t mangle -D OUTPUT -d ${exclude} -j RETURN 2>/dev/null || true")
+      done
+      cmds+=("if ip link show tailscale0 >/dev/null 2>&1; then iptables -t mangle -D OUTPUT -o tailscale0 -j RETURN 2>/dev/null || true; fi")
+      if [[ -n "$mesh_cidr" ]]; then
+        cmds+=("ip route del ${mesh_cidr} dev %i table ${TABLE_EXIT} 2>/dev/null || true")
+      fi
+      cmds+=("ip route del default dev %i table ${TABLE_EXIT} 2>/dev/null || true")
+      cmds+=("ip rule del pref 100 fwmark ${MARK_EXIT} lookup ${TABLE_EXIT} 2>/dev/null || true")
     fi
     if [[ -n "$extra_down" ]]; then
       cmds+=("$extra_down")
@@ -469,9 +578,79 @@ validate_config() {
     errors=$((errors + 1))
   fi
 
+  local topology
+  topology="$(mesh_topology)"
+  if [[ -n "$topology" && ! "$topology" =~ ^(fullmesh|star)$ ]]; then
+    echo "mesh topology must be fullmesh or star (got: $topology)" >&2
+    errors=$((errors + 1))
+  fi
+
+  local hub_selection="${MESH[hub_selection]:-}"
+  hub_selection="$(trim "$hub_selection")"
+  hub_selection="${hub_selection,,}"
+  if [[ -n "$hub_selection" && ! "$hub_selection" =~ ^(static|latency)$ ]]; then
+    echo "hub_selection must be static or latency (got: $hub_selection)" >&2
+    errors=$((errors + 1))
+  fi
+
+  if [[ "$topology" == "star" ]]; then
+    local hub_list=()
+    split_csv "${MESH[hubs]:-}" hub_list
+    if [[ ${#hub_list[@]} -eq 0 ]]; then
+      echo "Star topology requires hubs to be defined in [mesh]." >&2
+      errors=$((errors + 1))
+    else
+      local hub
+      for hub in "${hub_list[@]}"; do
+        if [[ -z "${NODE_NAMES[$hub]:-}" ]]; then
+          echo "Star topology hubs includes unknown node: $hub" >&2
+          errors=$((errors + 1))
+        fi
+      done
+    fi
+  fi
+
+  if (( MARK_EXIT == MARK_MESH_BYPASS )); then
+    echo "MARK_EXIT and MARK_MESH_BYPASS must be distinct." >&2
+    errors=$((errors + 1))
+  fi
+  if (( MARK_EXIT & TAILSCALE_MASK )); then
+    echo "MARK_EXIT overlaps with Tailscale reserved mark range (0xff0000)." >&2
+    errors=$((errors + 1))
+  fi
+  if (( MARK_MESH_BYPASS & TAILSCALE_MASK )); then
+    echo "MARK_MESH_BYPASS overlaps with Tailscale reserved mark range (0xff0000)." >&2
+    errors=$((errors + 1))
+  fi
+  if (( TABLE_EXIT >= 253 || TABLE_EXIT <= 0 )); then
+    echo "TABLE_EXIT must be between 1 and 252 to avoid reserved routing tables." >&2
+    errors=$((errors + 1))
+  fi
+
   if [[ ${#NODE_NAMES[@]} -eq 0 ]]; then
     echo "No nodes defined in mesh inventory" >&2
     errors=$((errors + 1))
+  fi
+
+  local mesh_cidr="${MESH[mesh_cidr]:-}"
+  if [[ -n "$mesh_cidr" && ! validate_cidr "$mesh_cidr" ]]; then
+    echo "mesh_cidr is not CIDR: $mesh_cidr" >&2
+    errors=$((errors + 1))
+  fi
+  if [[ -n "$mesh_cidr" ]]; then
+    local mesh_ip
+    mesh_ip="$(strip_cidr "$mesh_cidr")"
+    if [[ "$mesh_ip" == *":"* ]]; then
+      if ! is_ula_ipv6 "$mesh_ip"; then
+        echo "mesh_cidr must use ULA for IPv6 (got: $mesh_cidr)" >&2
+        errors=$((errors + 1))
+      fi
+    else
+      if ! is_rfc1918_ipv4 "$mesh_ip"; then
+        echo "mesh_cidr must use RFC1918 IPv4 space (got: $mesh_cidr)" >&2
+        errors=$((errors + 1))
+      fi
+    fi
   fi
 
   local exit_nodes="${MESH[exit_nodes]:-}"
@@ -482,6 +661,10 @@ validate_config() {
   local enable_exit_for_nodes="${MESH[enable_exit_for_nodes]:-}"
 
   if [[ -n "$exit_nodes" || -n "$enable_exit_for_nodes" ]]; then
+    if [[ -z "$mesh_cidr" ]]; then
+      echo "mesh_cidr must be set in [mesh] when exit routing is enabled." >&2
+      errors=$((errors + 1))
+    fi
     if [[ -z "$exit_nodes" ]]; then
       echo "exit_nodes must be set in [mesh] when enable_exit_for_nodes is configured." >&2
       errors=$((errors + 1))
@@ -594,6 +777,27 @@ validate_config() {
       echo "Node $node_name address is not CIDR: $address" >&2
       errors=$((errors + 1))
     fi
+    if [[ -n "$address" ]]; then
+      local node_ip
+      node_ip="$(strip_cidr "$address")"
+      if [[ "$node_ip" == *":"* ]]; then
+        if ! is_ula_ipv6 "$node_ip"; then
+          echo "Node $node_name address must use ULA IPv6 space: $address" >&2
+          errors=$((errors + 1))
+        fi
+      else
+        if ! is_rfc1918_ipv4 "$node_ip"; then
+          echo "Node $node_name address must use RFC1918 IPv4 space: $address" >&2
+          errors=$((errors + 1))
+        fi
+        if [[ -n "$mesh_cidr" && "$mesh_cidr" != *":"* ]]; then
+          if ! ipv4_in_cidr "$node_ip" "$mesh_cidr"; then
+            echo "Node $node_name address is outside mesh_cidr: $address (mesh_cidr: $mesh_cidr)" >&2
+            errors=$((errors + 1))
+          fi
+        fi
+      fi
+    fi
 
     if [[ -n "$allowed_ips" ]]; then
       IFS=',' read -ra ips <<< "$allowed_ips"
@@ -654,12 +858,16 @@ gen_configs() {
   local file="$1"
   local out_dir="$2"
   local gen_keys="$3"
-
   if [[ "$gen_keys" == "true" ]]; then
     generate_keys_for_inventory "$file" "$out_dir"
   fi
 
   validate_config "$file" "$gen_keys"
+
+  local topology
+  topology="$(mesh_topology)"
+  local hub_list=()
+  split_csv "${MESH[hubs]:-}" hub_list
 
   mkdir -p "$out_dir"
 
@@ -700,10 +908,34 @@ gen_configs() {
       fi
       echo ""
 
-      for peer in "${!NODE_NAMES[@]}"; do
-        if [[ "$peer" == "$node_name" ]]; then
-          continue
+      local peers=()
+      if [[ "$topology" == "star" ]]; then
+        if node_is_hub "$node_name"; then
+          local peer
+          for peer in "${!NODE_NAMES[@]}"; do
+            if [[ "$peer" != "$node_name" ]]; then
+              peers+=("$peer")
+            fi
+          done
+        else
+          local hub
+          for hub in "${hub_list[@]}"; do
+            if [[ "$hub" != "$node_name" ]]; then
+              peers+=("$hub")
+            fi
+          done
         fi
+      else
+        local peer
+        for peer in "${!NODE_NAMES[@]}"; do
+          if [[ "$peer" != "$node_name" ]]; then
+            peers+=("$peer")
+          fi
+        done
+      fi
+
+      local peer
+      for peer in "${peers[@]}"; do
         local peer_key
         peer_key="$(resolve_public_key "$peer" "$out_dir" "$gen_keys")"
         local peer_allowed="${NODE_FIELDS[$peer.allowed_ips]:-}"
