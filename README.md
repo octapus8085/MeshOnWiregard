@@ -1,6 +1,18 @@
 # MeshOnWiregard
 
-This repo provides a minimal inventory-driven workflow for generating WireGuard mesh configs and a failover helper to swap peer endpoints when the primary host is unreachable.
+This repo provides a minimal inventory-driven workflow for generating WireGuard configs, with optional exit routing and failover helpers. It supports both **full-mesh** and **star (hub/spoke)** topologies, uses RFC1918/ULA IP planning, and standardizes policy routing to avoid fwmark conflicts.
+
+## Documentation
+
+Start with the in-repo docs:
+
+- `docs/00-overview.md` (overview)
+- `docs/01-inventory-spec.md` (full schema + examples)
+- `docs/02-topologies.md` (full mesh vs star)
+- `docs/03-routing-fwmark.md` (marks/tables/exclusions)
+- `docs/06-migration-guide.md` (full mesh → star)
+
+If you want to publish docs, a minimal `mkdocs.yml` is included.
 
 ## Files
 
@@ -106,6 +118,9 @@ for macOS.
 ## Inventory requirements
 
 - `[mesh]` must include `interface` (e.g., `wg0`).
+- `[mesh]` should include `mesh_cidr` (required for exit routing) and use RFC1918/ULA ranges.
+- `[mesh]` can include `topology = star` and `hubs = node1,node2` for hub/spoke designs.
+- Optional: `tailscale_iface = tailscale0` to bypass exit-routing marks for Tailscale traffic.
 - `[mesh]` can include `local_node` to indicate which `[node]` entry refers to
   the current host (used as a default for `apply` when `--node` is omitted).
 - Each `[node "name"]` entry must include:
@@ -153,7 +168,7 @@ for macOS.
 If a node does **not** define `endpoint_alt`, no automatic failover is possible
 for that peer.
 
-## Smart exit routing (full mesh)
+## Smart exit routing (mesh)
 
 This repo can keep full-mesh connectivity intact while forwarding **internet
 traffic** through the cheapest/closest exit node. Mesh peer `AllowedIPs` remain
@@ -187,11 +202,12 @@ enable_nat = true
   configured `exit_out_iface`.
 - **Exit-enabled nodes** get:
   - `Table = off` to prevent wg-quick from managing routes.
-  - Policy routing in table `100`:
-    - mark non-mesh traffic with `fwmark 0x1`,
-    - `ip rule` sends the marked traffic to table `100`,
-    - `ip route` adds a default route via `wg0` in table `100`,
-    - mesh `/32` routes are added explicitly to keep mesh traffic local.
+  - Policy routing in table `101`:
+    - mark non-mesh traffic with `fwmark 0x101`,
+    - `ip rule` sends the marked traffic to table `101`,
+    - `ip route` adds a default route via `wg0` in table `101`,
+    - `ip route` adds `mesh_cidr` to keep mesh traffic local,
+    - excludes RFC1918, loopback, and Tailscale CGNAT ranges from marking.
 - The **wg-exit-selector** service:
   - measures reachability using WireGuard handshakes and ping to exit WG IPs,
   - selects the lowest-latency reachable exit (or `exit_primary` in manual mode),
@@ -217,7 +233,7 @@ to force a specific exit.
 
 ```bash
 ip rule show
-ip route show table 100
+ip route show table 101
 wg show wg0 allowed-ips
 ./wgmesh.sh exit-status
 sudo wg-exit-selector status
@@ -255,19 +271,19 @@ WireGuard allowed IPs with Linux policy routing:
    Example: route a LAN behind the spoke (`192.168.50.0/24`) through the hub while
    keeping the host’s own traffic local:
    ```bash
-   # Use table 100 for hub egress.
-   sudo ip rule add from 192.168.50.0/24 table 100
-   # Prefer charlie as default in table 100.
-   sudo ip route replace default via 10.0.0.3 dev wg0 table 100
+   # Use table 101 for hub egress.
+   sudo ip rule add from 192.168.50.0/24 table 101
+   # Prefer charlie as default in table 101.
+   sudo ip route replace default via 10.0.0.3 dev wg0 table 101
    ```
 3. **Add a simple failover hook** to prefer `charlie` but fall back to `bravo`.
    A lightweight timer or cron job can update the route based on reachability:
    ```bash
    # If charlie is reachable, keep it as the egress.
    if ping -c1 -W1 10.0.0.3 >/dev/null 2>&1; then
-     sudo ip route replace default via 10.0.0.3 dev wg0 table 100
+     sudo ip route replace default via 10.0.0.3 dev wg0 table 101
    else
-     sudo ip route replace default via 10.0.0.2 dev wg0 table 100
+     sudo ip route replace default via 10.0.0.2 dev wg0 table 101
    fi
    ```
 
@@ -282,8 +298,8 @@ WireGuard allowed IPs with Linux policy routing:
 
    [node "alpha"]
    # Spoke node: optional routing policy for a LAN behind the spoke.
-   post_up = ip rule add from 192.168.50.0/24 table 100; ip route replace default via 10.40.0.3 dev %i table 100
-   post_down = ip rule del from 192.168.50.0/24 table 100; ip route del default via 10.40.0.3 dev %i table 100
+   post_up = ip rule add from 192.168.50.0/24 table 101; ip route replace default via 10.40.0.3 dev %i table 101
+   post_down = ip rule del from 192.168.50.0/24 table 101; ip route del default via 10.40.0.3 dev %i table 101
    ```
    This emits valid `PostUp`/`PostDown` lines in each generated config. Hub
    nodes get `sysctl -w net.ipv4.ip_forward=1` plus iptables forward/NAT rules,
