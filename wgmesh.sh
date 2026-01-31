@@ -679,6 +679,15 @@ prune_nodes() {
 
   awk -v remove_csv="$remove_csv" '
     function trim(s){ gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    function flush(line){
+      if (line ~ /^[ \t]*$/) {
+        blank++
+        if (blank <= 2) { print line }
+        next
+      }
+      blank=0
+      print line
+    }
     function node_section(line, name){
       if (match(line, /^[ \t]*\[[ \t]*node[ \t]+\"?([^\"\]]+)\"?[ \t]*\][ \t]*$/, m)) {
         name=m[1]
@@ -688,15 +697,6 @@ prune_nodes() {
     }
     function is_section(line){
       return (line ~ /^[ \t]*\[[^]]+\][ \t]*$/)
-    }
-    function emit(line){
-      if (line ~ /^[ \t]*$/) {
-        blank++
-        if (blank <= 2) { print line }
-      } else {
-        blank=0
-        print line
-      }
     }
     BEGIN{
       n=split(remove_csv, arr, ",")
@@ -714,18 +714,18 @@ prune_nodes() {
           next
         }
         skip=0
-        emit($0)
+        flush($0)
         next
       }
       if (is_section($0)) {
         skip=0
-        emit($0)
+        flush($0)
         next
       }
       if (skip) {
         next
       }
-      emit($0)
+      flush($0)
     }
   ' "$file" > "$tmp_file"
 
