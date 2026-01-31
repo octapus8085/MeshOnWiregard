@@ -82,6 +82,25 @@ See the in-repo documentation under `docs/`:
    sudo systemctl status wg-failover.timer
    ```
 
+## Prune nodes from the inventory
+
+Use `prune-nodes` (bulk) or `remove-node` (single) to delete `[node]` sections
+from a mesh inventory file. The command preserves the rest of the file and
+creates a timestamped backup before applying changes.
+
+```bash
+./wgmesh.sh prune-nodes -c mesh.local.conf --nodes "alpha,bravo" --dry-run
+./wgmesh.sh remove-node -c mesh.local.conf --node alpha
+```
+
+Safety notes:
+
+- By default, key files are **not** deleted (`--keep-keys`).
+- Use `--delete-keys --yes` to remove `private_key_path` files for removed nodes,
+  but only when they live under `/etc/wireguard` or `out/keys`.
+- Use `--out-clean` to delete generated output files for removed nodes
+  (best-effort, ignores missing files).
+
 ## OS prerequisites
 
 ### Ubuntu (systemd)

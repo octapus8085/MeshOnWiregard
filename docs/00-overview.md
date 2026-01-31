@@ -38,3 +38,16 @@ $EDITOR mesh.local.conf
 ./wgmesh.sh validate -c mesh.local.conf
 ./wgmesh.sh gen -c mesh.local.conf -o ./out
 ```
+
+## Pruning nodes
+
+To remove node sections from an inventory file safely, use the prune helpers:
+
+```bash
+./wgmesh.sh prune-nodes -c mesh.local.conf --nodes "alpha,bravo" --dry-run
+./wgmesh.sh remove-node -c mesh.local.conf --node alpha
+```
+
+By default, key files are kept. If you want to remove keys referenced by
+`private_key_path`, use `--delete-keys --yes` (only deletes paths under
+`/etc/wireguard` or `out/keys`).
