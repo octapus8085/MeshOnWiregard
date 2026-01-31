@@ -18,6 +18,8 @@ Commands:
   validate                 Validate mesh.conf inventory and required fields.
   gen                      Generate WireGuard configs for all nodes.
   gen-keys                 Generate missing keypairs and write them to mesh.conf.
+  prune-nodes              Remove node sections from a mesh config file.
+  remove-node              Remove a single node section from a mesh config file.
   install-failover         Install wg-failover script and systemd units.
   install-exit-selector    Install wg-exit-selector script and systemd units.
   uninstall-exit-selector  Remove wg-exit-selector script and systemd units.
@@ -42,10 +44,21 @@ Options (apply-remote):
   --ssh-tty                Allocate a TTY for SSH (useful for sudo prompts).
   --dry-run                Print target paths without writing.
 
+Options (prune-nodes/remove-node):
+  --nodes <csv>            Comma-delimited list of nodes to prune (prune-nodes).
+  -n, --node <name>        Node name to prune (remove-node).
+  --keep-keys              Keep private_key_path files (default).
+  --delete-keys            Delete private_key_path files for removed nodes (requires --yes).
+  --out-clean              Delete generated output files for removed nodes.
+  --yes                    Confirm deletions when using --delete-keys.
+  --dry-run                Print nodes/paths without making changes.
+
 Examples:
   ./wgmesh.sh validate
   ./wgmesh.sh gen -o ./out
   ./wgmesh.sh gen-keys
+  ./wgmesh.sh prune-nodes -c mesh.local.conf --nodes "alpha,bravo"
+  ./wgmesh.sh remove-node -c mesh.local.conf --node alpha
   sudo ./wgmesh.sh apply --node alpha
   sudo ./wgmesh.sh install-failover
   sudo ./wgmesh.sh install-exit-selector -c mesh.local.conf
@@ -76,6 +89,31 @@ split_csv() {
     fi
   done
   out_array=("${filtered[@]}")
+}
+
+normalize_path() {
+  local path="$1"
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$path"
+    return
+  fi
+  echo "$path"
+}
+
+is_safe_key_path() {
+  local path="$1"
+  local out_dir="$2"
+  local normalized
+  normalized="$(normalize_path "$path")"
+  local keys_dir
+  keys_dir="$(normalize_path "$out_dir/keys")"
+  if [[ "$normalized" == /etc/wireguard/* ]]; then
+    return 0
+  fi
+  if [[ "$normalized" == "$keys_dir/"* ]]; then
+    return 0
+  fi
+  return 1
 }
 
 list_contains_csv() {
@@ -527,6 +565,194 @@ validate_cidr() {
   return 1
 }
 
+prune_nodes() {
+  local file="$1"
+  local out_dir="$2"
+  local nodes_csv="$3"
+  local keep_keys="$4"
+  local delete_keys="$5"
+  local out_clean="$6"
+  local dry_run="$7"
+  local confirm_yes="$8"
+
+  if [[ -z "$nodes_csv" ]]; then
+    echo "--nodes or --node is required for prune-nodes/remove-node." >&2
+    exit 1
+  fi
+
+  load_config "$file"
+
+  local requested_nodes=()
+  split_csv "$nodes_csv" requested_nodes
+
+  local remove_nodes=()
+  local missing_nodes=()
+  local node_name
+  for node_name in "${requested_nodes[@]}"; do
+    if [[ -n "${NODE_NAMES[$node_name]:-}" ]]; then
+      remove_nodes+=("$node_name")
+    else
+      missing_nodes+=("$node_name")
+    fi
+  done
+
+  if [[ ${#missing_nodes[@]} -gt 0 ]]; then
+    printf 'Warning: node(s) not found in %s: %s\n' "$file" "$(IFS=', '; echo "${missing_nodes[*]}")" >&2
+  fi
+
+  if [[ ${#remove_nodes[@]} -eq 0 ]]; then
+    echo "No matching nodes found to remove."
+    return 0
+  fi
+
+  local remove_csv
+  remove_csv="$(IFS=','; echo "${remove_nodes[*]}")"
+
+  local key_paths=()
+  if [[ "$delete_keys" == "true" ]]; then
+    for node_name in "${remove_nodes[@]}"; do
+      local key_path="${NODE_FIELDS[$node_name.private_key_path]:-}"
+      if [[ -n "$key_path" ]]; then
+        if is_safe_key_path "$key_path" "$out_dir"; then
+          key_paths+=("$key_path")
+        else
+          printf 'Warning: skipping unsafe key path for %s: %s\n' "$node_name" "$key_path" >&2
+        fi
+      fi
+    done
+  fi
+
+  local out_files=()
+  if [[ "$out_clean" == "true" ]]; then
+    for node_name in "${remove_nodes[@]}"; do
+      out_files+=("$out_dir/${node_name}.conf")
+      out_files+=("$out_dir/keys/${node_name}.key")
+      out_files+=("$out_dir/keys/${node_name}.pub")
+    done
+  fi
+
+  echo "Pruning nodes from $file:"
+  for node_name in "${remove_nodes[@]}"; do
+    printf '  - %s\n' "$node_name"
+  done
+
+  if [[ "$dry_run" == "true" ]]; then
+    echo "Dry-run: no changes will be made."
+    for node_name in "${remove_nodes[@]}"; do
+      printf 'Would remove section: [node \"%s\"]\n' "$node_name"
+    done
+    if [[ "$delete_keys" == "true" ]]; then
+      if [[ ${#key_paths[@]} -gt 0 ]]; then
+        echo "Would delete key files (requires --yes when not using --dry-run):"
+        printf '  - %s\n' "${key_paths[@]}"
+      else
+        echo "No safe key files found to delete."
+      fi
+    fi
+    if [[ "$out_clean" == "true" ]]; then
+      if [[ ${#out_files[@]} -gt 0 ]]; then
+        echo "Would delete output files:"
+        printf '  - %s\n' "${out_files[@]}"
+      fi
+    fi
+    return 0
+  fi
+
+  if [[ "$delete_keys" == "true" && "$confirm_yes" != "true" ]]; then
+    if [[ ${#key_paths[@]} -gt 0 ]]; then
+      echo "Planned key deletions:"
+      printf '  - %s\n' "${key_paths[@]}"
+    else
+      echo "No safe key files found to delete."
+    fi
+    echo "Re-run with --yes to delete key files."
+    exit 1
+  fi
+
+  local timestamp
+  timestamp="$(date +%Y%m%d%H%M%S)"
+  local backup="${file}.bak.${timestamp}"
+  cp "$file" "$backup"
+
+  local tmp_file
+  tmp_file="$(mktemp "${file}.tmp.XXXXXX")"
+
+  awk -v remove_csv="$remove_csv" '
+    function trim(s){ gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    function flush(line){
+      if (line ~ /^[ \t]*$/) {
+        blank++
+        if (blank <= 2) { print line }
+        next
+      }
+      blank=0
+      print line
+    }
+    function node_section(line, name){
+      if (match(line, /^[ \t]*\[[ \t]*node[ \t]+\"?([^\"\]]+)\"?[ \t]*\][ \t]*$/, m)) {
+        name=m[1]
+        return 1
+      }
+      return 0
+    }
+    function is_section(line){
+      return (line ~ /^[ \t]*\[[^]]+\][ \t]*$/)
+    }
+    BEGIN{
+      n=split(remove_csv, arr, ",")
+      for (i=1;i<=n;i++) {
+        name=trim(arr[i])
+        if (name != "") remove[name]=1
+      }
+      skip=0
+      blank=0
+    }
+    {
+      if (node_section($0, node)) {
+        if (node in remove) {
+          skip=1
+          next
+        }
+        skip=0
+        flush($0)
+        next
+      }
+      if (is_section($0)) {
+        skip=0
+        flush($0)
+        next
+      }
+      if (skip) {
+        next
+      }
+      flush($0)
+    }
+  ' "$file" > "$tmp_file"
+
+  parse_mesh_conf "$tmp_file" >/dev/null
+
+  mv "$tmp_file" "$file"
+  echo "Updated $file (backup: $backup)"
+
+  if [[ "$delete_keys" == "true" && ${#key_paths[@]} -gt 0 ]]; then
+    for node_name in "${key_paths[@]}"; do
+      if [[ -f "$node_name" ]]; then
+        rm -f "$node_name"
+        echo "Deleted key: $node_name"
+      fi
+    done
+  fi
+
+  if [[ "$out_clean" == "true" && ${#out_files[@]} -gt 0 ]]; then
+    for node_name in "${out_files[@]}"; do
+      if [[ -e "$node_name" ]]; then
+        rm -f "$node_name"
+        echo "Removed output: $node_name"
+      fi
+    done
+  fi
+}
+
 load_config() {
   local file="$1"
   if [[ ! -f "$file" ]]; then
@@ -633,11 +859,11 @@ validate_config() {
   fi
 
   local mesh_cidr="${MESH[mesh_cidr]:-}"
-  if [[ -n "$mesh_cidr" && ! validate_cidr "$mesh_cidr" ]]; then
-    echo "mesh_cidr is not CIDR: $mesh_cidr" >&2
-    errors=$((errors + 1))
-  fi
   if [[ -n "$mesh_cidr" ]]; then
+    if ! validate_cidr "$mesh_cidr"; then
+      echo "mesh_cidr is not CIDR: $mesh_cidr" >&2
+      errors=$((errors + 1))
+    fi
     local mesh_ip
     mesh_ip="$(strip_cidr "$mesh_cidr")"
     if [[ "$mesh_ip" == *":"* ]]; then
@@ -712,9 +938,11 @@ validate_config() {
         errors=$((errors + 1))
       fi
     done
-    if [[ -n "$exit_primary" && ! list_contains_csv "$exit_nodes" "$exit_primary" ]]; then
-      echo "exit_primary must be one of exit_nodes (got: $exit_primary)" >&2
-      errors=$((errors + 1))
+    if [[ -n "$exit_primary" ]]; then
+      if ! list_contains_csv "$exit_nodes" "$exit_primary"; then
+        echo "exit_primary must be one of exit_nodes (got: $exit_primary)" >&2
+        errors=$((errors + 1))
+      fi
     fi
     if [[ -n "$enable_exit_for_nodes" ]]; then
       shopt -s nocasematch
@@ -1468,11 +1696,18 @@ main() {
   local config="$DEFAULT_CONFIG"
   local out_dir="$DEFAULT_OUT_DIR"
   local node=""
+  local nodes_csv=""
   local override_iface=""
   local dry_run="false"
   local all_nodes="false"
   local gen_keys="false"
   local ssh_tty="false"
+  local keep_keys="true"
+  local keep_keys_set="false"
+  local delete_keys="false"
+  local delete_keys_set="false"
+  local out_clean="false"
+  local confirm_yes="false"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1486,6 +1721,10 @@ main() {
         ;;
       -n|--node)
         node="$2"
+        shift 2
+        ;;
+      --nodes)
+        nodes_csv="$2"
         shift 2
         ;;
       --interface)
@@ -1506,6 +1745,25 @@ main() {
         ;;
       --gen-keys)
         gen_keys="true"
+        shift
+        ;;
+      --keep-keys)
+        keep_keys="true"
+        keep_keys_set="true"
+        shift
+        ;;
+      --delete-keys)
+        delete_keys="true"
+        delete_keys_set="true"
+        keep_keys="false"
+        shift
+        ;;
+      --out-clean)
+        out_clean="true"
+        shift
+        ;;
+      --yes)
+        confirm_yes="true"
         shift
         ;;
       -h|--help)
@@ -1529,6 +1787,24 @@ main() {
       ;;
     gen-keys)
       generate_keys_for_inventory "$config" "$out_dir"
+      ;;
+    prune-nodes)
+      if [[ "$delete_keys_set" == "true" && "$keep_keys_set" == "true" ]]; then
+        echo "--keep-keys and --delete-keys cannot be used together." >&2
+        exit 1
+      fi
+      local target_nodes="$nodes_csv"
+      if [[ -z "$target_nodes" && -n "$node" ]]; then
+        target_nodes="$node"
+      fi
+      prune_nodes "$config" "$out_dir" "$target_nodes" "$keep_keys" "$delete_keys" "$out_clean" "$dry_run" "$confirm_yes"
+      ;;
+    remove-node)
+      if [[ "$delete_keys_set" == "true" && "$keep_keys_set" == "true" ]]; then
+        echo "--keep-keys and --delete-keys cannot be used together." >&2
+        exit 1
+      fi
+      prune_nodes "$config" "$out_dir" "$node" "$keep_keys" "$delete_keys" "$out_clean" "$dry_run" "$confirm_yes"
       ;;
     install-failover)
       install_failover
