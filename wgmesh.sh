@@ -859,11 +859,11 @@ validate_config() {
   fi
 
   local mesh_cidr="${MESH[mesh_cidr]:-}"
-  if [[ -n "$mesh_cidr" && ! validate_cidr "$mesh_cidr" ]]; then
-    echo "mesh_cidr is not CIDR: $mesh_cidr" >&2
-    errors=$((errors + 1))
-  fi
   if [[ -n "$mesh_cidr" ]]; then
+    if ! validate_cidr "$mesh_cidr"; then
+      echo "mesh_cidr is not CIDR: $mesh_cidr" >&2
+      errors=$((errors + 1))
+    fi
     local mesh_ip
     mesh_ip="$(strip_cidr "$mesh_cidr")"
     if [[ "$mesh_ip" == *":"* ]]; then
@@ -938,9 +938,11 @@ validate_config() {
         errors=$((errors + 1))
       fi
     done
-    if [[ -n "$exit_primary" && ! list_contains_csv "$exit_nodes" "$exit_primary" ]]; then
-      echo "exit_primary must be one of exit_nodes (got: $exit_primary)" >&2
-      errors=$((errors + 1))
+    if [[ -n "$exit_primary" ]]; then
+      if ! list_contains_csv "$exit_nodes" "$exit_primary"; then
+        echo "exit_primary must be one of exit_nodes (got: $exit_primary)" >&2
+        errors=$((errors + 1))
+      fi
     fi
     if [[ -n "$enable_exit_for_nodes" ]]; then
       shopt -s nocasematch
