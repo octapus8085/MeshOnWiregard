@@ -688,12 +688,11 @@ prune_nodes() {
       blank=0
       print line
     }
-    function node_section(line, name){
+    function node_name(line){
       if (match(line, /^[ \t]*\[[ \t]*node[ \t]+\"?([^\"\]]+)\"?[ \t]*\][ \t]*$/, m)) {
-        name=m[1]
-        return 1
+        return m[1]
       }
-      return 0
+      return ""
     }
     function is_section(line){
       return (line ~ /^[ \t]*\[[^]]+\][ \t]*$/)
@@ -708,7 +707,8 @@ prune_nodes() {
       blank=0
     }
     {
-      if (node_section($0, node)) {
+      node = node_name($0)
+      if (node != "") {
         if (node in remove) {
           skip=1
           next
